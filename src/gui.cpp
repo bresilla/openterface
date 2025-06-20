@@ -30,10 +30,8 @@
 #endif
 
 namespace {
-    int create_memfd(const char *name, unsigned int flags) {
-        return syscall(__NR_memfd_create, name, flags);
-    }
-}
+    int create_memfd(const char *name, unsigned int flags) { return syscall(__NR_memfd_create, name, flags); }
+} // namespace
 
 namespace openterface {
 
@@ -43,7 +41,12 @@ namespace openterface {
         struct wl_shell *shell = nullptr;
         struct wl_shm *shm = nullptr;
         struct xdg_wm_base *xdg_wm_base = nullptr;
+        struct wl_seat *seat = nullptr;
         std::function<void(const std::string &)> log_func;
+        
+        // Input state tracking
+        bool mouse_over = false;
+        bool input_active = false;
     };
 
     // XDG shell callbacks
@@ -57,7 +60,7 @@ namespace openterface {
 
     static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface, uint32_t serial) {
         xdg_surface_ack_configure(xdg_surface, serial);
-        
+
         // Commit the surface after acknowledging configure
         auto *callback_data = static_cast<WaylandCallbackData *>(data);
         if (callback_data->log_func) {
@@ -87,7 +90,8 @@ namespace openterface {
         }
     }
 
-    static void xdg_toplevel_configure_bounds(void *data, struct xdg_toplevel *xdg_toplevel, int32_t width, int32_t height) {
+    static void xdg_toplevel_configure_bounds(void *data, struct xdg_toplevel *xdg_toplevel, int32_t width,
+                                              int32_t height) {
         // Handle configure bounds
         auto *callback_data = static_cast<WaylandCallbackData *>(data);
         if (callback_data->log_func) {
@@ -96,7 +100,8 @@ namespace openterface {
         }
     }
 
-    static void xdg_toplevel_wm_capabilities(void *data, struct xdg_toplevel *xdg_toplevel, struct wl_array *capabilities) {
+    static void xdg_toplevel_wm_capabilities(void *data, struct xdg_toplevel *xdg_toplevel,
+                                             struct wl_array *capabilities) {
         // Handle WM capabilities
         auto *callback_data = static_cast<WaylandCallbackData *>(data);
         if (callback_data->log_func) {
@@ -135,17 +140,26 @@ namespace openterface {
         struct wl_shell *shell = nullptr;
         struct wl_shell_surface *shell_surface = nullptr;
         struct wl_shm *shm = nullptr;
-        
+
         // XDG shell objects
         struct xdg_wm_base *xdg_wm_base = nullptr;
         struct xdg_surface *xdg_surface = nullptr;
         struct xdg_toplevel *xdg_toplevel = nullptr;
-        
+
+        // Input objects
+        struct wl_seat *seat = nullptr;
+        struct wl_pointer *pointer = nullptr;
+        struct wl_keyboard *keyboard = nullptr;
+
+        // Input state
+        bool mouse_over_surface = false;
+        bool input_grabbed = false;
+
         // Buffer for rendering
         struct wl_buffer *buffer = nullptr;
         void *shm_data = nullptr;
         int shm_fd = -1;
-        
+
         WaylandCallbackData callback_data;
 
         void log(const std::string &msg) {
@@ -159,6 +173,205 @@ namespace openterface {
         bool createWaylandWindow();
         bool createBuffer(int width, int height);
         void destroyBuffer();
+    };
+
+    // Simple input callbacks using callback data
+    static void simple_seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabilities) {
+        auto *callback_data = static_cast<WaylandCallbackData *>(data);
+        
+        if (callback_data->log_func) {
+            callback_data->log_func("🎯 Seat capabilities callback triggered!");
+            callback_data->log_func("🎯 Capabilities: " + std::to_string(capabilities));
+        }
+        
+        // Forward declarations
+        extern const struct wl_pointer_listener debug_pointer_listener;
+        extern const struct wl_keyboard_listener debug_keyboard_listener;
+        
+        if (capabilities & WL_SEAT_CAPABILITY_POINTER) {
+            struct wl_pointer *pointer = wl_seat_get_pointer(seat);
+            if (pointer && callback_data->log_func) {
+                callback_data->log_func("🖱️  Setting up mouse input capture");
+                wl_pointer_add_listener(pointer, &debug_pointer_listener, callback_data);
+            }
+        }
+        
+        if (capabilities & WL_SEAT_CAPABILITY_KEYBOARD) {
+            struct wl_keyboard *keyboard = wl_seat_get_keyboard(seat);
+            if (keyboard && callback_data->log_func) {
+                callback_data->log_func("⌨️  Setting up keyboard input capture");
+                wl_keyboard_add_listener(keyboard, &debug_keyboard_listener, callback_data);
+            }
+        }
+    }
+
+    static void simple_seat_name(void *data, struct wl_seat *seat, const char *name) {
+        auto *callback_data = static_cast<WaylandCallbackData *>(data);
+        if (callback_data->log_func) {
+            callback_data->log_func("Input seat name: " + std::string(name));
+        }
+    }
+
+    static const struct wl_seat_listener simple_seat_listener = {
+        simple_seat_capabilities,
+        simple_seat_name,
+    };
+
+    // Pointer callbacks for debugging
+    static void debug_pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial,
+                                    struct wl_surface *surface, wl_fixed_t sx, wl_fixed_t sy) {
+        auto *callback_data = static_cast<WaylandCallbackData *>(data);
+        callback_data->mouse_over = true;
+        if (callback_data->log_func) {
+            callback_data->log_func("🎯 DEBUG: pointer_enter callback called!");
+            callback_data->log_func("🖱️  Mouse ENTERED window");
+        }
+    }
+
+    static void debug_pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial,
+                                    struct wl_surface *surface) {
+        auto *callback_data = static_cast<WaylandCallbackData *>(data);
+        callback_data->mouse_over = false;
+        if (callback_data->log_func) {
+            callback_data->log_func("🖱️  Mouse LEFT window");
+        }
+    }
+
+    static void debug_pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time,
+                                     wl_fixed_t sx, wl_fixed_t sy) {
+        auto *callback_data = static_cast<WaylandCallbackData *>(data);
+        if (callback_data->mouse_over && callback_data->log_func) {
+            int x = wl_fixed_to_int(sx);
+            int y = wl_fixed_to_int(sy);
+            std::string msg = "🖱️  Mouse motion: (" + std::to_string(x) + ", " + std::to_string(y) + ")";
+            callback_data->log_func(msg);
+        }
+    }
+
+    static void debug_pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial,
+                                     uint32_t time, uint32_t button, uint32_t state) {
+        auto *callback_data = static_cast<WaylandCallbackData *>(data);
+        if (callback_data->mouse_over && callback_data->log_func) {
+            const char *action = (state == WL_POINTER_BUTTON_STATE_PRESSED) ? "PRESSED" : "RELEASED";
+            const char *btn_name = "";
+            switch(button) {
+                case 0x110: btn_name = "LEFT"; break;
+                case 0x111: btn_name = "RIGHT"; break;
+                case 0x112: btn_name = "MIDDLE"; break;
+                default: btn_name = "UNKNOWN"; break;
+            }
+            std::string msg = "🖱️  Mouse " + std::string(btn_name) + " button " + action;
+            callback_data->log_func(msg);
+        }
+    }
+
+    static void debug_pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time,
+                                   uint32_t axis, wl_fixed_t value) {
+        auto *callback_data = static_cast<WaylandCallbackData *>(data);
+        if (callback_data->mouse_over && callback_data->log_func) {
+            const char *axis_name = (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) ? "VERTICAL" : "HORIZONTAL";
+            double scroll_value = wl_fixed_to_double(value);
+            std::string msg = "🖱️  Mouse scroll " + std::string(axis_name) + ": " + std::to_string(scroll_value);
+            callback_data->log_func(msg);
+        }
+    }
+
+    static void debug_pointer_frame(void *data, struct wl_pointer *pointer) {
+        // Frame event - end of pointer event group
+    }
+
+    static void debug_pointer_axis_source(void *data, struct wl_pointer *pointer, uint32_t axis_source) {
+        // Axis source (wheel, finger, etc.)
+    }
+
+    static void debug_pointer_axis_stop(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis) {
+        // Axis scrolling stopped
+    }
+
+    static void debug_pointer_axis_discrete(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t discrete) {
+        // Discrete axis events (scroll wheel clicks)
+    }
+
+    static void debug_pointer_axis_value120(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t value120) {
+        // High-resolution scroll wheel events  
+    }
+
+    static void debug_pointer_axis_relative_direction(void *data, struct wl_pointer *pointer, uint32_t axis, uint32_t direction) {
+        // Relative direction for axis events
+    }
+
+    const struct wl_pointer_listener debug_pointer_listener = {
+        debug_pointer_enter,
+        debug_pointer_leave,
+        debug_pointer_motion,
+        debug_pointer_button,
+        debug_pointer_axis,
+        debug_pointer_frame,
+        debug_pointer_axis_source,
+        debug_pointer_axis_stop,
+        debug_pointer_axis_discrete,
+        debug_pointer_axis_value120,
+        debug_pointer_axis_relative_direction,
+    };
+
+    // Keyboard callbacks for debugging  
+    static void debug_keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t format,
+                                      int32_t fd, uint32_t size) {
+        close(fd); // Just close the keymap fd for now
+    }
+
+    static void debug_keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial,
+                                     struct wl_surface *surface, struct wl_array *keys) {
+        auto *callback_data = static_cast<WaylandCallbackData *>(data);
+        callback_data->input_active = true;
+        if (callback_data->log_func) {
+            callback_data->log_func("⌨️  Keyboard FOCUS gained - capturing input");
+        }
+    }
+
+    static void debug_keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t serial,
+                                     struct wl_surface *surface) {
+        auto *callback_data = static_cast<WaylandCallbackData *>(data);
+        callback_data->input_active = false;
+        if (callback_data->log_func) {
+            callback_data->log_func("⌨️  Keyboard FOCUS lost - input released");
+        }
+    }
+
+    static void debug_keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial,
+                                   uint32_t time, uint32_t key, uint32_t state) {
+        auto *callback_data = static_cast<WaylandCallbackData *>(data);
+        if (callback_data->input_active && callback_data->log_func) {
+            const char *action = (state == WL_KEYBOARD_KEY_STATE_PRESSED) ? "PRESSED" : "RELEASED";
+            std::string msg = "⌨️  Key " + std::to_string(key) + " " + action;
+            callback_data->log_func(msg);
+        }
+    }
+
+    static void debug_keyboard_modifiers(void *data, struct wl_keyboard *keyboard, uint32_t serial,
+                                         uint32_t mods_depressed, uint32_t mods_latched,
+                                         uint32_t mods_locked, uint32_t group) {
+        auto *callback_data = static_cast<WaylandCallbackData *>(data);
+        if (callback_data->input_active && callback_data->log_func && 
+            (mods_depressed || mods_latched || mods_locked)) {
+            std::string msg = "⌨️  Modifiers: Ctrl=" + std::to_string((mods_depressed & 4) ? 1 : 0) +
+                              " Shift=" + std::to_string((mods_depressed & 1) ? 1 : 0) +
+                              " Alt=" + std::to_string((mods_depressed & 8) ? 1 : 0);
+            callback_data->log_func(msg);
+        }
+    }
+
+    static void debug_keyboard_repeat_info(void *data, struct wl_keyboard *keyboard, int32_t rate, int32_t delay) {
+        // Keyboard repeat info
+    }
+
+    const struct wl_keyboard_listener debug_keyboard_listener = {
+        debug_keyboard_keymap,
+        debug_keyboard_enter,
+        debug_keyboard_leave,
+        debug_keyboard_key,
+        debug_keyboard_modifiers,
+        debug_keyboard_repeat_info,
     };
 
     GUI::GUI() : pImpl(std::make_unique<Impl>()) {}
@@ -415,10 +628,22 @@ namespace openterface {
         shell = callback_data.shell;
         shm = callback_data.shm;
         xdg_wm_base = callback_data.xdg_wm_base;
+        seat = callback_data.seat;
         std::cout << "DEBUG: compositor=" << (compositor ? "found" : "null") << std::endl;
         std::cout << "DEBUG: shell=" << (shell ? "found" : "null") << std::endl;
         std::cout << "DEBUG: shm=" << (shm ? "found" : "null") << std::endl;
         std::cout << "DEBUG: xdg_wm_base=" << (xdg_wm_base ? "found" : "null") << std::endl;
+        std::cout << "DEBUG: seat=" << (seat ? "found" : "null") << std::endl;
+
+        // Set up seat listener immediately if seat is available
+        if (seat) {
+            log("Setting up seat listener for input capabilities");
+            wl_seat_add_listener(seat, &simple_seat_listener, &callback_data);
+            
+            // Trigger another roundtrip to get seat capabilities
+            wl_display_roundtrip(display);
+            log("Seat listener setup complete");
+        }
 
         // Check if we have required globals (shell is optional for now)
         if (!compositor || !shm) {
@@ -456,6 +681,22 @@ namespace openterface {
         if (xdg_wm_base) {
             xdg_wm_base_destroy(xdg_wm_base);
             xdg_wm_base = nullptr;
+        }
+
+        // Clean up input objects
+        if (keyboard) {
+            wl_keyboard_destroy(keyboard);
+            keyboard = nullptr;
+        }
+
+        if (pointer) {
+            wl_pointer_destroy(pointer);
+            pointer = nullptr;
+        }
+
+        if (seat) {
+            wl_seat_destroy(seat);
+            seat = nullptr;
         }
 
         // Clean up wl_shell objects
@@ -516,10 +757,10 @@ namespace openterface {
         // Use xdg_shell if available (modern), fall back to wl_shell (deprecated)
         if (xdg_wm_base) {
             log("Using XDG shell (modern)");
-            
+
             // Add xdg_wm_base listener
             xdg_wm_base_add_listener(xdg_wm_base, &xdg_wm_base_listener, &callback_data);
-            
+
             // Create xdg_surface
             xdg_surface = xdg_wm_base_get_xdg_surface(xdg_wm_base, surface);
             if (!xdg_surface) {
@@ -527,10 +768,10 @@ namespace openterface {
                 return false;
             }
             log("Created XDG surface");
-            
+
             // Add xdg_surface listener
             xdg_surface_add_listener(xdg_surface, &xdg_surface_listener, &callback_data);
-            
+
             // Create xdg_toplevel
             xdg_toplevel = xdg_surface_get_toplevel(xdg_surface);
             if (!xdg_toplevel) {
@@ -538,37 +779,47 @@ namespace openterface {
                 return false;
             }
             log("Created XDG toplevel");
-            
+
             // Add xdg_toplevel listener
             xdg_toplevel_add_listener(xdg_toplevel, &xdg_toplevel_listener, &callback_data);
-            
+
             // Set window properties
             xdg_toplevel_set_title(xdg_toplevel, info.window_title.c_str());
             xdg_toplevel_set_app_id(xdg_toplevel, "com.openterface.openterfaceQT");
-            
+
+            // Maximize the window
+            xdg_toplevel_set_maximized(xdg_toplevel);
+
             // Set minimum size to ensure window is visible
-            xdg_toplevel_set_min_size(xdg_toplevel, info.window_width, info.window_height);
-            
+            xdg_toplevel_set_min_size(xdg_toplevel, 800, 600);
+
             // Commit surface to trigger initial configure
             wl_surface_commit(surface);
-            
+
             // Wait for configure event
             wl_display_roundtrip(display);
-            
+
             // Create buffer with content
             if (!createBuffer(info.window_width, info.window_height)) {
                 log("Failed to create buffer");
                 return false;
             }
-            
+
             // Attach buffer and commit
             wl_surface_attach(surface, buffer, 0, 0);
             wl_surface_damage(surface, 0, 0, info.window_width, info.window_height);
             wl_surface_commit(surface);
-            
+
+            // Set up input if seat is available
+            if (seat) {
+                log("Input capture system ready - move mouse over window and type keys to test");
+            } else {
+                log("Warning: No input seat available - input capture disabled");
+            }
+
         } else if (shell) {
             log("Using wl_shell (deprecated)");
-            
+
             // Create shell surface only if shell is available
             shell_surface = wl_shell_get_shell_surface(shell, surface);
             if (!shell_surface) {
@@ -580,10 +831,10 @@ namespace openterface {
             // Set shell surface as toplevel
             wl_shell_surface_set_toplevel(shell_surface);
             wl_shell_surface_set_title(shell_surface, info.window_title.c_str());
-            
+
             // Commit surface
             wl_surface_commit(surface);
-            
+
         } else {
             log("No shell interface available - cannot create window");
             return false;
@@ -687,9 +938,14 @@ namespace openterface {
             if (callback_data->log_func)
                 callback_data->log_func("Found shared memory");
         } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
-            callback_data->xdg_wm_base = static_cast<xdg_wm_base *>(wl_registry_bind(registry, id, &xdg_wm_base_interface, 1));
+            callback_data->xdg_wm_base =
+                static_cast<xdg_wm_base *>(wl_registry_bind(registry, id, &xdg_wm_base_interface, 1));
             if (callback_data->log_func)
                 callback_data->log_func("Found xdg_wm_base");
+        } else if (strcmp(interface, wl_seat_interface.name) == 0) {
+            callback_data->seat = static_cast<wl_seat *>(wl_registry_bind(registry, id, &wl_seat_interface, 1));
+            if (callback_data->log_func)
+                callback_data->log_func("Found seat");
         }
     }
 
