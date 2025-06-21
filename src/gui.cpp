@@ -12,16 +12,16 @@
 
 // Wayland includes
 #include "wayland/xdg-shell-client-protocol.h"
-#include <fcntl.h>
-#include <string.h>
 #include <cstring>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <wayland-client.h>
 #include <wayland-cursor.h>
-#include <errno.h>
-#include <poll.h>
 
 // For memfd_create
 #include <sys/syscall.h>
@@ -54,7 +54,7 @@ namespace openterface {
         bool mouse_over = false;
         bool input_active = false;
         bool debug_mode = false;
-        
+
         // Window and buffer management
         struct wl_surface *surface = nullptr;
         struct wl_buffer **buffer_ptr = nullptr;
@@ -63,22 +63,26 @@ namespace openterface {
         int *current_width = nullptr;
         int *current_height = nullptr;
         bool *needs_resize = nullptr;
-        
+
         // Resize state tracking
         bool is_resizing = false;
         int resize_edge = 0;
         int last_mouse_x = 0;
         int last_mouse_y = 0;
-        
+
         // Window objects for resize operations
         struct xdg_toplevel *xdg_toplevel = nullptr;
         uint32_t resize_serial = 0;
-        
+
         // Cursor objects
         struct wl_cursor_theme *cursor_theme = nullptr;
         struct wl_cursor *default_cursor = nullptr;
         struct wl_surface *cursor_surface = nullptr;
         
+        // Input objects - pointers to store them in the parent Impl
+        struct wl_pointer **pointer_ptr = nullptr;
+        struct wl_keyboard **keyboard_ptr = nullptr;
+
         // Resize constants
         static constexpr int RESIZE_BORDER = 10; // 10px border for resize detection
     };
@@ -87,7 +91,7 @@ namespace openterface {
     static void xdg_wm_base_ping(void *data, struct xdg_wm_base *xdg_wm_base, uint32_t serial) {
         // Always respond to ping immediately - this is critical for window responsiveness
         xdg_wm_base_pong(xdg_wm_base, serial);
-        
+
         auto *callback_data = static_cast<WaylandCallbackData *>(data);
         if (callback_data && callback_data->log_func) {
             callback_data->log_func("[PING] Received XDG ping, sent pong (serial=" + std::to_string(serial) + ")");
@@ -116,17 +120,17 @@ namespace openterface {
                                        struct wl_array *states) {
         // Handle window configure (resize, etc.)
         auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        
+
         // Add null pointer checks
         if (!callback_data) {
             return;
         }
-        
+
         if (callback_data->log_func) {
             std::string msg = "XDG toplevel configured: " + std::to_string(width) + "x" + std::to_string(height);
             callback_data->log_func(msg);
         }
-        
+
         // Validate pointers before dereferencing
         if (!callback_data->current_width || !callback_data->current_height || !callback_data->needs_resize) {
             if (callback_data->log_func) {
@@ -134,7 +138,7 @@ namespace openterface {
             }
             return;
         }
-        
+
         // If we have valid dimensions and they're different from current size, trigger resize
         if (width > 0 && height > 0 && width <= 4096 && height <= 4096) {
             if (*callback_data->current_width != width || *callback_data->current_height != height) {
@@ -142,21 +146,24 @@ namespace openterface {
                 auto now = std::chrono::steady_clock::now();
                 static auto last_update = std::chrono::steady_clock::time_point{};
                 auto time_since_last = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update);
-                
+
                 if (time_since_last.count() > 16) { // Limit to ~60 FPS
                     *callback_data->current_width = width;
                     *callback_data->current_height = height;
                     *callback_data->needs_resize = true;
                     last_update = now;
                     if (callback_data->log_func) {
-                        callback_data->log_func("Window resize triggered: " + std::to_string(width) + "x" + std::to_string(height));
+                        callback_data->log_func("Window resize triggered: " + std::to_string(width) + "x" +
+                                                std::to_string(height));
                     }
                 } else if (callback_data->log_func) {
-                    callback_data->log_func("Resize rate limited, skipping: " + std::to_string(width) + "x" + std::to_string(height));
+                    callback_data->log_func("Resize rate limited, skipping: " + std::to_string(width) + "x" +
+                                            std::to_string(height));
                 }
             }
         } else if (callback_data->log_func) {
-            callback_data->log_func("Warning: Invalid resize dimensions: " + std::to_string(width) + "x" + std::to_string(height));
+            callback_data->log_func("Warning: Invalid resize dimensions: " + std::to_string(width) + "x" +
+                                    std::to_string(height));
         }
     }
 
@@ -228,7 +235,7 @@ namespace openterface {
         struct wl_seat *seat = nullptr;
         struct wl_pointer *pointer = nullptr;
         struct wl_keyboard *keyboard = nullptr;
-        
+
         // Cursor objects
         struct wl_cursor_theme *cursor_theme = nullptr;
         struct wl_cursor *default_cursor = nullptr;
@@ -243,7 +250,7 @@ namespace openterface {
         void *shm_data = nullptr;
         int shm_fd = -1;
         bool needs_resize = false;
-        
+
         // Synchronization
         std::mutex resize_mutex;
         std::atomic<bool> resize_in_progress{false};
@@ -272,7 +279,7 @@ namespace openterface {
         bool createWaylandWindow();
         bool createBuffer(int width, int height);
         void destroyBuffer();
-        void onVideoFrame(const FrameData& frame);
+        void onVideoFrame(const FrameData &frame);
     };
 
     // Simple input callbacks using callback data
@@ -293,6 +300,12 @@ namespace openterface {
             if (pointer && callback_data->log_func) {
                 callback_data->log_func("🖱️  Setting up mouse input capture");
                 wl_pointer_add_listener(pointer, &debug_pointer_listener, callback_data);
+                
+                // Store pointer in GUI::Impl for proper cleanup
+                if (callback_data->pointer_ptr) {
+                    *callback_data->pointer_ptr = pointer;
+                    callback_data->log_func("🖱️  Mouse pointer stored for cleanup");
+                }
             }
         }
 
@@ -301,6 +314,12 @@ namespace openterface {
             if (keyboard && callback_data->log_func) {
                 callback_data->log_func("⌨️  Setting up keyboard input capture");
                 wl_keyboard_add_listener(keyboard, &debug_keyboard_listener, callback_data);
+                
+                // Store keyboard in GUI::Impl for proper cleanup
+                if (callback_data->keyboard_ptr) {
+                    *callback_data->keyboard_ptr = keyboard;
+                    callback_data->log_func("⌨️  Keyboard stored for cleanup");
+                }
             }
         }
     }
@@ -320,15 +339,19 @@ namespace openterface {
     // Helper function to determine resize edge
     static int get_resize_edge(int x, int y, int width, int height, int border_size) {
         int edge = 0;
-        
-        if (x < border_size) edge |= 1; // left
-        if (x > width - border_size) edge |= 2; // right
-        if (y < border_size) edge |= 4; // top
-        if (y > height - border_size) edge |= 8; // bottom
-        
+
+        if (x < border_size)
+            edge |= 1; // left
+        if (x > width - border_size)
+            edge |= 2; // right
+        if (y < border_size)
+            edge |= 4; // top
+        if (y > height - border_size)
+            edge |= 8; // bottom
+
         return edge;
     }
-    
+
     // Convert internal edge flags to XDG shell resize edges
     static uint32_t edge_to_xdg_edge(int edge) {
         // XDG_TOPLEVEL_RESIZE_EDGE constants
@@ -341,31 +364,40 @@ namespace openterface {
         const uint32_t XDG_TOPLEVEL_RESIZE_EDGE_RIGHT = 8;
         const uint32_t XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT = 9;
         const uint32_t XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT = 10;
-        
+
         switch (edge) {
-            case 1: return XDG_TOPLEVEL_RESIZE_EDGE_LEFT;       // left
-            case 2: return XDG_TOPLEVEL_RESIZE_EDGE_RIGHT;      // right  
-            case 4: return XDG_TOPLEVEL_RESIZE_EDGE_TOP;        // top
-            case 8: return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM;     // bottom
-            case 5: return XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT;   // top-left
-            case 6: return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT; // bottom-left
-            case 9: return XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT;  // top-right
-            case 10: return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT; // bottom-right
-            default: return XDG_TOPLEVEL_RESIZE_EDGE_NONE;
+        case 1:
+            return XDG_TOPLEVEL_RESIZE_EDGE_LEFT; // left
+        case 2:
+            return XDG_TOPLEVEL_RESIZE_EDGE_RIGHT; // right
+        case 4:
+            return XDG_TOPLEVEL_RESIZE_EDGE_TOP; // top
+        case 8:
+            return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM; // bottom
+        case 5:
+            return XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT; // top-left
+        case 6:
+            return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT; // bottom-left
+        case 9:
+            return XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT; // top-right
+        case 10:
+            return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT; // bottom-right
+        default:
+            return XDG_TOPLEVEL_RESIZE_EDGE_NONE;
         }
     }
 
     // Function to set cursor
     static void set_cursor(void *data, struct wl_pointer *pointer, uint32_t serial) {
         auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        
+
         if (!callback_data->default_cursor || !callback_data->cursor_surface) {
             if (callback_data->log_func) {
                 callback_data->log_func("Warning: No cursor available to set");
             }
             return;
         }
-        
+
         struct wl_cursor_image *image = callback_data->default_cursor->images[0];
         if (!image) {
             if (callback_data->log_func) {
@@ -373,16 +405,15 @@ namespace openterface {
             }
             return;
         }
-        
+
         // Attach cursor image to cursor surface
         wl_surface_attach(callback_data->cursor_surface, wl_cursor_image_get_buffer(image), 0, 0);
         wl_surface_damage(callback_data->cursor_surface, 0, 0, image->width, image->height);
         wl_surface_commit(callback_data->cursor_surface);
-        
+
         // Set the cursor
-        wl_pointer_set_cursor(pointer, serial, callback_data->cursor_surface, 
-                             image->hotspot_x, image->hotspot_y);
-        
+        wl_pointer_set_cursor(pointer, serial, callback_data->cursor_surface, image->hotspot_x, image->hotspot_y);
+
         if (callback_data->log_func) {
             callback_data->log_func("✅ Cursor set successfully");
         }
@@ -393,16 +424,19 @@ namespace openterface {
                                     wl_fixed_t sx, wl_fixed_t sy) {
         auto *callback_data = static_cast<WaylandCallbackData *>(data);
         callback_data->mouse_over = true;
-        
+
         // Store initial mouse position
         callback_data->last_mouse_x = wl_fixed_to_int(sx);
         callback_data->last_mouse_y = wl_fixed_to_int(sy);
-        
+
         if (callback_data->log_func) {
             callback_data->log_func("🎯 DEBUG: pointer_enter callback called!");
             callback_data->log_func("🖱️  Mouse ENTERED window");
+            if (callback_data->debug_mode) {
+                callback_data->log_func("[DEBUG] Mouse enter - ready for input capture");
+            }
         }
-        
+
         // Set cursor to make it visible
         set_cursor(data, pointer, serial);
     }
@@ -413,21 +447,37 @@ namespace openterface {
         callback_data->mouse_over = false;
         if (callback_data->log_func) {
             callback_data->log_func("🖱️  Mouse LEFT window");
+            if (callback_data->debug_mode) {
+                callback_data->log_func("[DEBUG] Mouse leave - input capture paused");
+            }
         }
     }
 
     static void debug_pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time, wl_fixed_t sx,
                                      wl_fixed_t sy) {
         auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        if (!callback_data->mouse_over) return;
         
+        // Debug: Always log the first few motion events to see what's happening
+        static int motion_debug_count = 0;
+        if (motion_debug_count < 10) {
+            motion_debug_count++;
+            if (callback_data->log_func) {
+                callback_data->log_func("[DEBUG] Motion event " + std::to_string(motion_debug_count) + 
+                                      ", debug_mode=" + std::string(callback_data->debug_mode ? "true" : "false") +
+                                      ", mouse_over=" + std::string(callback_data->mouse_over ? "true" : "false"));
+            }
+        }
+        
+        if (!callback_data->mouse_over)
+            return;
+
         int x = wl_fixed_to_int(sx);
         int y = wl_fixed_to_int(sy);
-        
+
         // Update stored position
         callback_data->last_mouse_x = x;
         callback_data->last_mouse_y = y;
-        
+
         // Check if we're currently resizing
         if (callback_data->is_resizing) {
             // Handle ongoing resize - this would be where you'd send resize requests
@@ -438,36 +488,37 @@ namespace openterface {
             }
             return;
         }
-        
+
         // Check if mouse is near window edges for resize cursor
         if (callback_data->current_width && callback_data->current_height) {
-            int edge = get_resize_edge(x, y, *callback_data->current_width, *callback_data->current_height, 
-                                     WaylandCallbackData::RESIZE_BORDER);
-            
+            int edge = get_resize_edge(x, y, *callback_data->current_width, *callback_data->current_height,
+                                       WaylandCallbackData::RESIZE_BORDER);
+
             if (edge != callback_data->resize_edge) {
                 callback_data->resize_edge = edge;
-                
+
                 // Log when entering/leaving resize areas
                 if (callback_data->log_func) {
                     if (edge != 0) {
-                        std::string msg = "🎯 Mouse near window edge - resize available (edge=" + std::to_string(edge) + ")";
+                        std::string msg =
+                            "🎯 Mouse near window edge - resize available (edge=" + std::to_string(edge) + ")";
                         callback_data->log_func(msg);
                     } else {
                         callback_data->log_func("🎯 Mouse in window center - normal cursor");
                     }
                 }
-                
+
                 // Here you would set different cursor shapes based on edge:
                 // edge == 1|2: horizontal resize cursor
-                // edge == 4|8: vertical resize cursor  
+                // edge == 4|8: vertical resize cursor
                 // edge == 5|6|9|10: diagonal resize cursors
             }
         }
-        
+
         // Debug logging for mouse motion
         if (callback_data->debug_mode && callback_data->log_func) {
             static int log_counter = 0;
-            if ((log_counter++ % 10 == 0)) { // Log every 10th motion event in debug mode
+            if ((log_counter++ % 5 == 0)) { // Log every 5th motion event in debug mode (was 10)
                 std::string msg = "[DEBUG] Mouse motion: (" + std::to_string(x) + ", " + std::to_string(y) + ")";
                 if (callback_data->resize_edge != 0) {
                     msg += " [resize edge: " + std::to_string(callback_data->resize_edge) + "]";
@@ -480,8 +531,17 @@ namespace openterface {
     static void debug_pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t time,
                                      uint32_t button, uint32_t state) {
         auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        if (!callback_data->mouse_over) return;
         
+        // Debug: Always log button events
+        if (callback_data->log_func) {
+            callback_data->log_func("[DEBUG] Button event received, debug_mode=" + 
+                                  std::string(callback_data->debug_mode ? "true" : "false") +
+                                  ", mouse_over=" + std::string(callback_data->mouse_over ? "true" : "false"));
+        }
+        
+        if (!callback_data->mouse_over)
+            return;
+
         const char *action = (state == WL_POINTER_BUTTON_STATE_PRESSED) ? "PRESSED" : "RELEASED";
         const char *btn_name = "";
         switch (button) {
@@ -498,7 +558,7 @@ namespace openterface {
             btn_name = "UNKNOWN";
             break;
         }
-        
+
         // Handle resize operations with left mouse button
         if (button == 0x110) { // Left mouse button
             if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
@@ -506,15 +566,15 @@ namespace openterface {
                 if (callback_data->resize_edge != 0 && callback_data->xdg_toplevel && callback_data->seat) {
                     callback_data->is_resizing = true;
                     callback_data->resize_serial = serial; // Store the serial for this resize operation
-                    
+
                     uint32_t xdg_edge = edge_to_xdg_edge(callback_data->resize_edge);
-                    
+
                     if (callback_data->log_func) {
-                        callback_data->log_func("🔄 Starting window resize operation (edge=" + 
-                                              std::to_string(callback_data->resize_edge) + 
-                                              ", xdg_edge=" + std::to_string(xdg_edge) + ")");
+                        callback_data->log_func(
+                            "🔄 Starting window resize operation (edge=" + std::to_string(callback_data->resize_edge) +
+                            ", xdg_edge=" + std::to_string(xdg_edge) + ")");
                     }
-                    
+
                     // Actually start the resize operation
                     xdg_toplevel_resize(callback_data->xdg_toplevel, callback_data->seat, serial, xdg_edge);
                 }
@@ -528,7 +588,7 @@ namespace openterface {
                 }
             }
         }
-        
+
         // Debug logging for mouse buttons
         if (callback_data->debug_mode && callback_data->log_func) {
             std::string msg = "[DEBUG] Mouse " + std::string(btn_name) + " button " + action;
@@ -616,10 +676,18 @@ namespace openterface {
     static void debug_keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time,
                                    uint32_t key, uint32_t state) {
         auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        // Debug logging for keyboard events
-        if (callback_data->input_active && callback_data->debug_mode && callback_data->log_func) {
+        
+        // Debug: Always log keyboard events
+        if (callback_data->log_func) {
+            callback_data->log_func("[DEBUG] Keyboard event received! debug_mode=" + 
+                                  std::string(callback_data->debug_mode ? "true" : "false") +
+                                  ", input_active=" + std::string(callback_data->input_active ? "true" : "false"));
+            
             const char *action = (state == WL_KEYBOARD_KEY_STATE_PRESSED) ? "PRESSED" : "RELEASED";
             std::string msg = "[DEBUG] Key " + std::to_string(key) + " " + action;
+            if (!callback_data->input_active) {
+                msg += " [WARNING: no keyboard focus]";
+            }
             callback_data->log_func(msg);
         }
     }
@@ -752,9 +820,7 @@ namespace openterface {
         pImpl->log("Starting video display");
 
         // Set up frame callback from video source
-        pImpl->video->setFrameCallback([this](const FrameData& frame) {
-            pImpl->onVideoFrame(frame);
-        });
+        pImpl->video->setFrameCallback([this](const FrameData &frame) { pImpl->onVideoFrame(frame); });
 
         // Start video capture
         if (!pImpl->video->startCapture()) {
@@ -855,16 +921,16 @@ namespace openterface {
         while (!pImpl->exit_requested && pImpl->display) {
             // Process any already pending events first
             wl_display_dispatch_pending(pImpl->display);
-            
+
             // Flush any pending requests to the compositor
             if (wl_display_flush(pImpl->display) < 0 && errno != EAGAIN) {
                 pImpl->log("Error flushing display: " + std::string(strerror(errno)));
                 break;
             }
-            
+
             // Poll with a short timeout to stay responsive
             int ret = poll(fds, 1, 5); // 5ms timeout for responsiveness
-            
+
             if (ret > 0) {
                 // Events are available, dispatch them directly
                 if (wl_display_dispatch(pImpl->display) == -1) {
@@ -878,37 +944,37 @@ namespace openterface {
                 pImpl->log("Error in poll: " + std::string(strerror(errno)));
                 break;
             }
-            
+
             // Handle resize in a separate thread if needed - don't block event loop
             if (pImpl->needs_resize && pImpl->surface) {
                 static auto last_resize_attempt = std::chrono::steady_clock::now();
                 auto now = std::chrono::steady_clock::now();
-                
+
                 // Only attempt resize every 16ms to avoid blocking too often
                 if (now - last_resize_attempt > std::chrono::milliseconds(16)) {
                     std::unique_lock<std::mutex> lock(pImpl->resize_mutex, std::try_to_lock);
                     if (lock.owns_lock() && pImpl->needs_resize && !pImpl->resize_in_progress.load()) {
                         pImpl->resize_in_progress = true;
-                        
+
                         // Quick dimension validation only
-                        if (pImpl->info.window_width > 0 && pImpl->info.window_height > 0 && 
+                        if (pImpl->info.window_width > 0 && pImpl->info.window_height > 0 &&
                             pImpl->info.window_width <= 4096 && pImpl->info.window_height <= 4096) {
-                            
+
                             // Defer heavy buffer operations - just mark for later
                             // This keeps the event loop responsive for ping/pong
                             pImpl->needs_resize = false;
                         }
-                        
+
                         pImpl->resize_in_progress = false;
                     }
                     last_resize_attempt = now;
                 }
             }
-            
+
             // Minimal frame commits without heavy operations
             static auto last_commit_time = std::chrono::steady_clock::now();
             auto now = std::chrono::steady_clock::now();
-            
+
             if (now - last_commit_time > std::chrono::milliseconds(16)) {
                 if (pImpl->surface && pImpl->buffer) {
                     wl_surface_damage(pImpl->surface, 0, 0, pImpl->info.window_width, pImpl->info.window_height);
@@ -931,6 +997,7 @@ namespace openterface {
 
     void GUI::setDebugMode(bool enabled) {
         pImpl->debug_input = enabled;
+        pImpl->callback_data.debug_mode = enabled;  // Update callback data too
         if (enabled) {
             pImpl->log("Debug mode enabled - input events will be logged");
         }
@@ -964,6 +1031,7 @@ namespace openterface {
         // Setup callback data
         std::cout << "DEBUG: Setting up callback data" << std::endl;
         callback_data.log_func = [this](const std::string &msg) { log(msg); };
+        callback_data.debug_mode = debug_input;  // Pass debug mode to callback data
 
         // Add registry listener with callback data
         std::cout << "DEBUG: About to add registry listener" << std::endl;
@@ -991,6 +1059,10 @@ namespace openterface {
         // Set up seat listener immediately if seat is available
         if (seat) {
             log("Setting up seat listener for input capabilities");
+            // Store pointer locations for callback data
+            callback_data.pointer_ptr = &pointer;
+            callback_data.keyboard_ptr = &keyboard;
+            
             wl_seat_add_listener(seat, &simple_seat_listener, &callback_data);
 
             // Process seat events without blocking
@@ -998,7 +1070,7 @@ namespace openterface {
             wl_display_dispatch_pending(display);
             log("Seat listener setup complete");
         }
-        
+
         // Initialize cursor theme
         if (shm) {
             log("Setting up cursor theme");
@@ -1063,7 +1135,7 @@ namespace openterface {
             wl_surface_destroy(cursor_surface);
             cursor_surface = nullptr;
         }
-        
+
         if (cursor_theme) {
             wl_cursor_theme_destroy(cursor_theme);
             cursor_theme = nullptr;
@@ -1147,7 +1219,7 @@ namespace openterface {
         callback_data.shm = shm;
         callback_data.xdg_wm_base = xdg_wm_base;
         callback_data.seat = seat;
-        callback_data.log_func = [this](const std::string& msg) { this->log(msg); };
+        callback_data.log_func = [this](const std::string &msg) { this->log(msg); };
         callback_data.surface = surface;
         callback_data.buffer_ptr = &buffer;
         callback_data.shm_data_ptr = &shm_data;
@@ -1159,6 +1231,8 @@ namespace openterface {
         callback_data.default_cursor = default_cursor;
         callback_data.cursor_surface = cursor_surface;
         callback_data.debug_mode = debug_input;
+        callback_data.pointer_ptr = &pointer;
+        callback_data.keyboard_ptr = &keyboard;
 
         // Use xdg_shell if available (modern), fall back to wl_shell (deprecated)
         if (xdg_wm_base) {
@@ -1199,10 +1273,10 @@ namespace openterface {
             // Make window resizable with reasonable constraints
             // Set minimum size (don't go smaller than this)
             xdg_toplevel_set_min_size(xdg_toplevel, 640, 480);
-            
+
             // Set maximum size (0, 0 means no maximum - fully resizable)
             xdg_toplevel_set_max_size(xdg_toplevel, 0, 0);
-            
+
             // Start with a reasonable default size instead of maximized
             // The window manager will respect this as a size hint
 
@@ -1268,17 +1342,17 @@ namespace openterface {
             log("Invalid buffer dimensions: " + std::to_string(width) + "x" + std::to_string(height));
             return false;
         }
-        
+
         // Reasonable size limits to prevent excessive memory usage
         if (width > 8192 || height > 8192) {
             log("Buffer dimensions too large: " + std::to_string(width) + "x" + std::to_string(height));
             return false;
         }
-        
+
         int stride = width * 4; // RGBA32
         int size = stride * height;
-        
-        log("Creating buffer: " + std::to_string(width) + "x" + std::to_string(height) + 
+
+        log("Creating buffer: " + std::to_string(width) + "x" + std::to_string(height) +
             " (stride=" + std::to_string(stride) + ", size=" + std::to_string(size) + " bytes)");
 
         // Create shared memory file
@@ -1323,34 +1397,34 @@ namespace openterface {
 
         // Fill buffer with video frame data or gradient pattern
         uint32_t *pixels = static_cast<uint32_t *>(shm_data);
-        
+
         {
             std::lock_guard<std::mutex> lock(frame_mutex);
-            
+
             if (has_new_frame && !current_frame.empty() && frame_width > 0 && frame_height > 0) {
                 // Display indicator that video frames are being received
-                log("Rendering video frame indicator: " + std::to_string(frame_width) + "x" + std::to_string(frame_height) + 
-                    " (" + std::to_string(current_frame.size()) + " bytes MJPEG)");
-                
+                log("Rendering video frame indicator: " + std::to_string(frame_width) + "x" +
+                    std::to_string(frame_height) + " (" + std::to_string(current_frame.size()) + " bytes MJPEG)");
+
                 // Create a visual indicator that video is being received
                 // This creates a animated pattern to show frames are coming in
                 static uint8_t frame_counter = 0;
                 frame_counter += 10;
-                
+
                 for (int y = 0; y < height; y++) {
                     for (int x = 0; x < width; x++) {
                         int dst_idx = y * width + x;
-                        
+
                         // Create a pattern that changes with each frame to show video activity
                         uint8_t red = static_cast<uint8_t>((x + frame_counter) % 256);
                         uint8_t green = static_cast<uint8_t>((y + frame_counter) % 256);
                         uint8_t blue = frame_counter;
-                        
+
                         // XRGB8888 format: 0xAARRGGBB
                         pixels[dst_idx] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
                     }
                 }
-                
+
                 has_new_frame = false; // Mark frame as processed
                 log("Video frame indicator rendered (MJPEG decoding needed for actual video)");
             } else {
@@ -1358,12 +1432,12 @@ namespace openterface {
                 for (int y = 0; y < height; y++) {
                     for (int x = 0; x < width; x++) {
                         int idx = y * width + x;
-                        
+
                         // Create a gradient pattern to help visualize scaling
                         uint8_t red = static_cast<uint8_t>((x * 255) / (width - 1));
                         uint8_t green = static_cast<uint8_t>((y * 255) / (height - 1));
                         uint8_t blue = 64; // Constant blue component
-                        
+
                         // XRGB8888 format: 0xAARRGGBB
                         pixels[idx] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
                     }
@@ -1379,7 +1453,7 @@ namespace openterface {
     void GUI::Impl::destroyBuffer() {
         std::lock_guard<std::mutex> lock(resize_mutex);
         log("Destroying buffer...");
-        
+
         // Destroy Wayland buffer first
         if (buffer) {
             wl_buffer_destroy(buffer);
@@ -1415,30 +1489,30 @@ namespace openterface {
             shm_fd = -1;
             log("File descriptor closed");
         }
-        
+
         log("Buffer destruction complete");
     }
 
-    void GUI::Impl::onVideoFrame(const FrameData& frame) {
+    void GUI::Impl::onVideoFrame(const FrameData &frame) {
         std::lock_guard<std::mutex> lock(frame_mutex);
-        
+
         // Store the frame data
         if (frame.data && frame.size > 0) {
             static int frame_count = 0;
             frame_count++;
-            
+
             // Only log every 30 frames to reduce spam
             if (frame_count % 30 == 1) {
-                log("Video frame " + std::to_string(frame_count) + ": " + std::to_string(frame.width) + "x" + std::to_string(frame.height) + 
-                    " size=" + std::to_string(frame.size) + " bytes");
+                log("Video frame " + std::to_string(frame_count) + ": " + std::to_string(frame.width) + "x" +
+                    std::to_string(frame.height) + " size=" + std::to_string(frame.size) + " bytes");
             }
-            
+
             current_frame.resize(frame.size);
             memcpy(current_frame.data(), frame.data, frame.size);
             frame_width = frame.width;
             frame_height = frame.height;
             has_new_frame = true;
-            
+
             // Force buffer recreation and surface update
             needs_resize = true;
         }

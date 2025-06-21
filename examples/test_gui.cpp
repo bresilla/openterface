@@ -4,6 +4,7 @@
 #include <thread>
 #include <csignal>
 #include <cstdlib>
+#include <cstring>
 
 void signal_handler(int signal) {
     std::cerr << "\n🚨 CRASH DETECTED - Signal " << signal << " received" << std::endl;
@@ -12,7 +13,15 @@ void signal_handler(int signal) {
     std::exit(signal);
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+    // Check for --debug flag
+    bool debug_mode = false;
+    for (int i = 1; i < argc; i++) {
+        if (std::strcmp(argv[i], "--debug") == 0) {
+            debug_mode = true;
+            break;
+        }
+    }
     // Install signal handler for crash detection
     std::signal(SIGSEGV, signal_handler);
     std::signal(SIGABRT, signal_handler);
@@ -28,6 +37,12 @@ int main() {
     }
 
     std::cout << "GUI initialized successfully" << std::endl;
+
+    // Enable debug mode if requested
+    if (debug_mode) {
+        gui.setDebugMode(true);
+        std::cout << "Debug mode enabled - input events will be logged" << std::endl;
+    }
 
     // Create a window with reasonable initial size
     if (!gui.createWindow("Openterface KVM Test", 800, 600)) {
