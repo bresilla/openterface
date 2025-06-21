@@ -4,3 +4,4 @@ build
 .execs
 .gdb_history
 output.tif
+.old
