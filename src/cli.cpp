@@ -20,28 +20,27 @@
 
 namespace openterface {
 
-    CLI::CLI()
-        : app("Openterface USB KVM CLI", "openterface") {
+    CLI::CLI() : app("Openterface USB KVM CLI", "openterface") {
         std::cout << "DEBUG: CLI constructor - starting" << std::endl;
-        
+
         std::cout << "DEBUG: Creating Serial" << std::endl;
         serial = std::make_unique<Serial>();
-        
+
         std::cout << "DEBUG: Creating Video" << std::endl;
         video = std::make_unique<Video>();
-        
+
         std::cout << "DEBUG: Creating Input" << std::endl;
         input = std::make_unique<Input>();
-        
+
         std::cout << "DEBUG: Creating GUI" << std::endl;
         gui = std::make_unique<GUI>();
-        
+
         std::cout << "DEBUG: Setting version flag" << std::endl;
         app.set_version_flag("--version", version);
-        
+
         std::cout << "DEBUG: Setting up commands" << std::endl;
         setupCommands();
-        
+
         std::cout << "DEBUG: CLI constructor - complete" << std::endl;
     }
 
@@ -58,7 +57,7 @@ namespace openterface {
         connect_cmd->add_flag("--dummy", dummy_mode, "Run in dummy mode (no device connection, GUI only)");
         connect_cmd->callback([this]() {
             std::cout << "DEBUG: Enter connect callback" << std::endl;
-            
+
             if (verbose)
                 std::cout << "Verbose mode enabled\n";
 
@@ -124,7 +123,7 @@ namespace openterface {
             }
 
             std::cout << "DEBUG: About to initialize GUI" << std::endl;
-            
+
             // Initialize and start GUI (both dummy and real modes)
             if (!gui->initialize()) {
                 std::cout << "✗ Failed to initialize GUI" << std::endl;
@@ -133,7 +132,7 @@ namespace openterface {
             std::cout << "✓ GUI initialized" << std::endl;
 
             std::cout << "DEBUG: About to create window" << std::endl;
-            
+
             // Create window
             std::string window_title = dummy_mode ? "Openterface KVM - Dummy Mode" : "Openterface KVM";
             if (!gui->createWindow(window_title, 1920, 1080)) {
@@ -179,23 +178,23 @@ namespace openterface {
             std::cout << "- Close window or press Ctrl+C to exit" << std::endl;
 
             std::cout << "DEBUG: About to run GUI event loop" << std::endl;
-            
+
             // Run the GUI event loop (blocking)
             int result = gui->runEventLoop();
             std::cout << "\nGUI exited with code: " << result << std::endl;
 
             std::cout << "DEBUG: GUI event loop finished, starting cleanup" << std::endl;
-            
+
             // Cleanup
             gui->stopInputCapture();
             std::cout << "DEBUG: Input capture stopped" << std::endl;
-            
+
             gui->stopVideoDisplay();
             std::cout << "DEBUG: Video display stopped" << std::endl;
-            
+
             gui->destroyWindow();
             std::cout << "DEBUG: Window destroyed" << std::endl;
-            
+
             gui->shutdown();
             std::cout << "DEBUG: GUI shutdown complete" << std::endl;
 

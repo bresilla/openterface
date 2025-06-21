@@ -38,7 +38,9 @@ list(APPEND ext_deps CLI11::CLI11)
 # Find Wayland
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
+pkg_check_modules(WAYLAND_CURSOR REQUIRED wayland-cursor)
 list(APPEND ext_deps ${WAYLAND_CLIENT_LIBRARIES})
+list(APPEND ext_deps ${WAYLAND_CURSOR_LIBRARIES})
 
 
 
