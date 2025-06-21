@@ -52,9 +52,10 @@ namespace openterface {
 
         // Connect command - simplified unified connection
         auto connect_cmd = app.add_subcommand("connect", "Connect to KVM device");
-        connect_cmd->add_option("--video", video_device, "Video device path")->default_val("/dev/video0");
-        connect_cmd->add_option("--serial", serial_port, "Serial device path")->default_val("/dev/ttyACM0");
+        connect_cmd->add_option("--video", video_device, "Video device path (optional - omit for no video capture)");
+        connect_cmd->add_option("--serial", serial_port, "Serial device path (optional - omit for no input forwarding)");
         connect_cmd->add_flag("--dummy", dummy_mode, "Run in dummy mode (no device connection, GUI only)");
+        connect_cmd->add_flag("--debug", debug_input, "Enable debug output for input events (mouse/keyboard)");
         connect_cmd->callback([this]() {
             std::cout << "DEBUG: Enter connect callback" << std::endl;
 
@@ -68,58 +69,44 @@ namespace openterface {
                 std::cout << "No device connections will be made." << std::endl;
             } else {
                 std::cout << "DEBUG: About to start device connection logic" << std::endl;
-                std::cout << "Connecting to Openterface KVM..." << std::endl;
-
-                // Auto-detect devices if defaults are used
-                if (video_device == "/dev/video0" || serial_port == "/dev/ttyACM0") {
-                    auto detected_serials = findOpenterfaceSerialPorts();
-
-                    // Auto-detect video device
-                    std::string detected_video;
-                    for (int i = 0; i < 10; i++) {
-                        std::string device = "/dev/video" + std::to_string(i);
-                        if (access(device.c_str(), F_OK) == 0) {
-                            std::string device_name = getVideoDeviceName(device);
-                            if (device_name.find("Openterface") != std::string::npos) {
-                                detected_video = device;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (!detected_serials.empty() && serial_port == "/dev/ttyACM0") {
-                        serial_port = detected_serials[0];
-                        std::cout << "Auto-detected serial: " << serial_port << std::endl;
-                    }
-
-                    if (!detected_video.empty() && video_device == "/dev/video0") {
-                        video_device = detected_video;
-                        std::cout << "Auto-detected video: " << video_device << std::endl;
-                    }
-                }
-
-                std::cout << "Video: " << video_device << std::endl;
-                std::cout << "Serial: " << serial_port << std::endl;
-
-                // Connect video
-                if (video->connect(video_device)) {
-                    std::cout << "✓ Video connected" << std::endl;
+                
+                bool has_video = !video_device.empty();
+                bool has_serial = !serial_port.empty();
+                
+                if (!has_video && !has_serial) {
+                    std::cout << "No video or serial devices specified - running in GUI-only mode" << std::endl;
                 } else {
-                    std::cout << "✗ Video connection failed" << std::endl;
-                    return;
+                    std::cout << "Connecting to Openterface KVM..." << std::endl;
+                    if (has_video) std::cout << "Video: " << video_device << std::endl;
+                    if (has_serial) std::cout << "Serial: " << serial_port << std::endl;
                 }
 
-                // Connect serial
-                if (serial->connect(serial_port, 115200)) {
-                    std::cout << "✓ Serial connected" << std::endl;
+                // Connect video if specified
+                if (has_video) {
+                    if (video->connect(video_device)) {
+                        std::cout << "✓ Video connected" << std::endl;
+                    } else {
+                        std::cout << "✗ Video connection failed" << std::endl;
+                        return;
+                    }
                 } else {
-                    std::cout << "✗ Serial connection failed" << std::endl;
-                    video->disconnect();
-                    return;
+                    std::cout << "- Video capture disabled (no --video specified)" << std::endl;
                 }
 
-                // Setup input forwarding
-                input->setSerial(std::shared_ptr<Serial>(serial.get(), [](Serial *) {}));
+                // Connect serial if specified
+                if (has_serial) {
+                    if (serial->connect(serial_port, 115200)) {
+                        std::cout << "✓ Serial connected" << std::endl;
+                        // Setup input forwarding only if serial is available
+                        input->setSerial(std::shared_ptr<Serial>(serial.get(), [](Serial *) {}));
+                    } else {
+                        std::cout << "✗ Serial connection failed" << std::endl;
+                        if (has_video) video->disconnect();
+                        return;
+                    }
+                } else {
+                    std::cout << "- Input forwarding disabled (no --serial specified)" << std::endl;
+                }
             }
 
             std::cout << "DEBUG: About to initialize GUI" << std::endl;
@@ -133,8 +120,25 @@ namespace openterface {
 
             std::cout << "DEBUG: About to create window" << std::endl;
 
-            // Create window
-            std::string window_title = dummy_mode ? "Openterface KVM - Dummy Mode" : "Openterface KVM";
+            // Create window with appropriate title
+            std::string window_title;
+            if (dummy_mode) {
+                window_title = "Openterface KVM - Dummy Mode";
+            } else {
+                bool has_video = !video_device.empty();
+                bool has_serial = !serial_port.empty();
+                
+                if (has_video && has_serial) {
+                    window_title = "Openterface KVM - Full Mode";
+                } else if (has_video) {
+                    window_title = "Openterface KVM - Video Only";
+                } else if (has_serial) {
+                    window_title = "Openterface KVM - Input Only";
+                } else {
+                    window_title = "Openterface KVM - GUI Only";
+                }
+            }
+            
             if (!gui->createWindow(window_title, 1920, 1080)) {
                 std::cout << "✗ Failed to create window" << std::endl;
                 std::cout << "DEBUG: Window creation failed, about to shutdown GUI" << std::endl;
@@ -145,36 +149,62 @@ namespace openterface {
 
             std::cout << "DEBUG: About to setup video display" << std::endl;
 
-            // Setup video display
-            gui->setVideoSource(std::shared_ptr<Video>(video.get(), [](Video *) {}));
-            if (gui->startVideoDisplay()) {
-                if (dummy_mode) {
-                    std::cout << "✓ Video display started (dummy mode - black screen)" << std::endl;
+            // Setup video display only if video is enabled
+            if (!video_device.empty() || dummy_mode) {
+                gui->setVideoSource(std::shared_ptr<Video>(video.get(), [](Video *) {}));
+                if (gui->startVideoDisplay()) {
+                    if (dummy_mode) {
+                        std::cout << "✓ Video display started (dummy mode - test pattern)" << std::endl;
+                    } else if (!video_device.empty()) {
+                        std::cout << "✓ Video display started" << std::endl;
+                    }
                 } else {
-                    std::cout << "✓ Video display started" << std::endl;
+                    std::cout << "✗ Failed to start video display" << std::endl;
                 }
             } else {
-                std::cout << "✗ Failed to start video display" << std::endl;
+                std::cout << "- Video display disabled (no --video specified)" << std::endl;
             }
 
-            // Setup input capture and forwarding
-            gui->setInputTarget(std::shared_ptr<Input>(input.get(), [](Input *) {}));
-            gui->setSerialForwarder(std::shared_ptr<Serial>(serial.get(), [](Serial *) {}));
-            if (gui->startInputCapture()) {
-                std::cout << "✓ Input capture started (keyboard/mouse will be forwarded)" << std::endl;
+            // Enable debug mode if requested
+            if (debug_input) {
+                gui->setDebugMode(true);
+            }
+
+            // Setup input capture and forwarding only if serial is enabled
+            if (!serial_port.empty() || dummy_mode) {
+                gui->setInputTarget(std::shared_ptr<Input>(input.get(), [](Input *) {}));
+                gui->setSerialForwarder(std::shared_ptr<Serial>(serial.get(), [](Serial *) {}));
+                if (gui->startInputCapture()) {
+                    std::cout << "✓ Input capture started (keyboard/mouse will be forwarded)" << std::endl;
+                } else {
+                    std::cout << "✗ Failed to start input capture" << std::endl;
+                }
             } else {
-                std::cout << "✗ Failed to start input capture" << std::endl;
+                std::cout << "- Input capture disabled (no --serial specified)" << std::endl;
             }
 
             std::cout << "\n=== KVM Ready ===" << std::endl;
             if (dummy_mode) {
                 std::cout << "- Running in dummy mode (no device connections)" << std::endl;
-                std::cout << "- Video will show black screen" << std::endl;
+                std::cout << "- Video will show test pattern" << std::endl;
+                std::cout << "- Input will be simulated (not forwarded)" << std::endl;
             } else {
-                std::cout << "- Device connections established" << std::endl;
-                std::cout << "- Video feed active" << std::endl;
+                bool has_video = !video_device.empty();
+                bool has_serial = !serial_port.empty();
+                
+                if (has_video && has_serial) {
+                    std::cout << "- Full KVM mode: Video display + Input forwarding" << std::endl;
+                } else if (has_video) {
+                    std::cout << "- Video-only mode: Display feed, no input forwarding" << std::endl;
+                } else if (has_serial) {
+                    std::cout << "- Input-only mode: Forwarding keyboard/mouse, no video" << std::endl;
+                } else {
+                    std::cout << "- GUI-only mode: Test window, no device connections" << std::endl;
+                }
+                
+                if (has_video) std::cout << "- Video feed active" << std::endl;
+                if (has_serial) std::cout << "- Input forwarding active" << std::endl;
             }
-            std::cout << "- Input (keyboard/mouse) will be captured and forwarded" << std::endl;
             std::cout << "- Close window or press Ctrl+C to exit" << std::endl;
 
             std::cout << "DEBUG: About to run GUI event loop" << std::endl;

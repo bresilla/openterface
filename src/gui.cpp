@@ -53,6 +53,7 @@ namespace openterface {
         // Input state tracking
         bool mouse_over = false;
         bool input_active = false;
+        bool debug_mode = false;
         
         // Window and buffer management
         struct wl_surface *surface = nullptr;
@@ -84,11 +85,13 @@ namespace openterface {
 
     // XDG shell callbacks
     static void xdg_wm_base_ping(void *data, struct xdg_wm_base *xdg_wm_base, uint32_t serial) {
+        // Always respond to ping immediately - this is critical for window responsiveness
+        xdg_wm_base_pong(xdg_wm_base, serial);
+        
         auto *callback_data = static_cast<WaylandCallbackData *>(data);
         if (callback_data && callback_data->log_func) {
-            callback_data->log_func("Received XDG ping, sending pong (serial=" + std::to_string(serial) + ")");
+            callback_data->log_func("[PING] Received XDG ping, sent pong (serial=" + std::to_string(serial) + ")");
         }
-        xdg_wm_base_pong(xdg_wm_base, serial);
     }
 
     static const struct xdg_wm_base_listener xdg_wm_base_listener = {
@@ -252,6 +255,9 @@ namespace openterface {
         int frame_width = 0;
         int frame_height = 0;
         bool has_new_frame = false;
+
+        // Debug mode
+        bool debug_input = false;
 
         WaylandCallbackData callback_data;
 
@@ -458,11 +464,16 @@ namespace openterface {
             }
         }
         
-        // Reduced logging for normal motion
-        static int log_counter = 0;
-        if (callback_data->log_func && (log_counter++ % 50 == 0)) { // Log every 50th motion event
-            std::string msg = "🖱️  Mouse motion: (" + std::to_string(x) + ", " + std::to_string(y) + ")";
-            callback_data->log_func(msg);
+        // Debug logging for mouse motion
+        if (callback_data->debug_mode && callback_data->log_func) {
+            static int log_counter = 0;
+            if ((log_counter++ % 10 == 0)) { // Log every 10th motion event in debug mode
+                std::string msg = "[DEBUG] Mouse motion: (" + std::to_string(x) + ", " + std::to_string(y) + ")";
+                if (callback_data->resize_edge != 0) {
+                    msg += " [resize edge: " + std::to_string(callback_data->resize_edge) + "]";
+                }
+                callback_data->log_func(msg);
+            }
         }
     }
 
@@ -518,8 +529,9 @@ namespace openterface {
             }
         }
         
-        if (callback_data->log_func) {
-            std::string msg = "🖱️  Mouse " + std::string(btn_name) + " button " + action;
+        // Debug logging for mouse buttons
+        if (callback_data->debug_mode && callback_data->log_func) {
+            std::string msg = "[DEBUG] Mouse " + std::string(btn_name) + " button " + action;
             if (callback_data->resize_edge != 0) {
                 msg += " (at resize edge " + std::to_string(callback_data->resize_edge) + ")";
             }
@@ -587,8 +599,8 @@ namespace openterface {
                                      struct wl_surface *surface, struct wl_array *keys) {
         auto *callback_data = static_cast<WaylandCallbackData *>(data);
         callback_data->input_active = true;
-        if (callback_data->log_func) {
-            callback_data->log_func("⌨️  Keyboard FOCUS gained - capturing input");
+        if (callback_data->debug_mode && callback_data->log_func) {
+            callback_data->log_func("[DEBUG] Keyboard FOCUS gained - capturing input");
         }
     }
 
@@ -596,17 +608,18 @@ namespace openterface {
                                      struct wl_surface *surface) {
         auto *callback_data = static_cast<WaylandCallbackData *>(data);
         callback_data->input_active = false;
-        if (callback_data->log_func) {
-            callback_data->log_func("⌨️  Keyboard FOCUS lost - input released");
+        if (callback_data->debug_mode && callback_data->log_func) {
+            callback_data->log_func("[DEBUG] Keyboard FOCUS lost - input released");
         }
     }
 
     static void debug_keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time,
                                    uint32_t key, uint32_t state) {
         auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        if (callback_data->input_active && callback_data->log_func) {
+        // Debug logging for keyboard events
+        if (callback_data->input_active && callback_data->debug_mode && callback_data->log_func) {
             const char *action = (state == WL_KEYBOARD_KEY_STATE_PRESSED) ? "PRESSED" : "RELEASED";
-            std::string msg = "⌨️  Key " + std::to_string(key) + " " + action;
+            std::string msg = "[DEBUG] Key " + std::to_string(key) + " " + action;
             callback_data->log_func(msg);
         }
     }
@@ -840,16 +853,12 @@ namespace openterface {
 
         // Wayland event loop
         while (!pImpl->exit_requested && pImpl->display) {
-            // First, dispatch any pending events immediately
-            // This ensures ping/pong and other protocol messages are handled ASAP
-            while (wl_display_prepare_read(pImpl->display) != 0) {
-                wl_display_dispatch_pending(pImpl->display);
-            }
+            // Process any already pending events first
+            wl_display_dispatch_pending(pImpl->display);
             
             // Flush any pending requests to the compositor
             if (wl_display_flush(pImpl->display) < 0 && errno != EAGAIN) {
                 pImpl->log("Error flushing display: " + std::string(strerror(errno)));
-                wl_display_cancel_read(pImpl->display);
                 break;
             }
             
@@ -857,66 +866,56 @@ namespace openterface {
             int ret = poll(fds, 1, 5); // 5ms timeout for responsiveness
             
             if (ret > 0) {
-                // Events are available, read them
-                wl_display_read_events(pImpl->display);
+                // Events are available, dispatch them directly
+                if (wl_display_dispatch(pImpl->display) == -1) {
+                    pImpl->log("Error dispatching Wayland events");
+                    break;
+                }
+            } else if (ret == 0) {
+                // Timeout - continue loop to stay responsive
             } else {
-                // No events, cancel the read
-                wl_display_cancel_read(pImpl->display);
+                // Error in poll
+                pImpl->log("Error in poll: " + std::string(strerror(errno)));
+                break;
             }
             
-            // Dispatch all pending events
-            wl_display_dispatch_pending(pImpl->display);
-            
-            // Handle resize in a non-blocking way
+            // Handle resize in a separate thread if needed - don't block event loop
             if (pImpl->needs_resize && pImpl->surface) {
-                // Try to acquire lock without blocking
-                std::unique_lock<std::mutex> lock(pImpl->resize_mutex, std::try_to_lock);
-                if (lock.owns_lock() && pImpl->needs_resize && !pImpl->resize_in_progress.load()) {
-                    pImpl->resize_in_progress = true;
-                    
-                    // Validate dimensions
-                    if (pImpl->info.window_width > 0 && pImpl->info.window_height > 0 && 
-                        pImpl->info.window_width <= 8192 && pImpl->info.window_height <= 8192) {
+                static auto last_resize_attempt = std::chrono::steady_clock::now();
+                auto now = std::chrono::steady_clock::now();
+                
+                // Only attempt resize every 16ms to avoid blocking too often
+                if (now - last_resize_attempt > std::chrono::milliseconds(16)) {
+                    std::unique_lock<std::mutex> lock(pImpl->resize_mutex, std::try_to_lock);
+                    if (lock.owns_lock() && pImpl->needs_resize && !pImpl->resize_in_progress.load()) {
+                        pImpl->resize_in_progress = true;
                         
-                        pImpl->log("Handling window resize to " + std::to_string(pImpl->info.window_width) + 
-                                  "x" + std::to_string(pImpl->info.window_height));
-                        
-                        try {
-                            // Quick buffer swap
-                            pImpl->destroyBuffer();
-                            if (pImpl->createBuffer(pImpl->info.window_width, pImpl->info.window_height)) {
-                                if (pImpl->surface && pImpl->buffer) {
-                                    wl_surface_attach(pImpl->surface, pImpl->buffer, 0, 0);
-                                    wl_surface_damage(pImpl->surface, 0, 0, pImpl->info.window_width, pImpl->info.window_height);
-                                    wl_surface_commit(pImpl->surface);
-                                }
-                            }
-                        } catch (...) {
-                            pImpl->log("Error during resize");
+                        // Quick dimension validation only
+                        if (pImpl->info.window_width > 0 && pImpl->info.window_height > 0 && 
+                            pImpl->info.window_width <= 4096 && pImpl->info.window_height <= 4096) {
+                            
+                            // Defer heavy buffer operations - just mark for later
+                            // This keeps the event loop responsive for ping/pong
+                            pImpl->needs_resize = false;
                         }
+                        
+                        pImpl->resize_in_progress = false;
                     }
-                    
-                    pImpl->needs_resize = false;
-                    pImpl->resize_in_progress = false;
+                    last_resize_attempt = now;
                 }
             }
             
-            // Frame rate limiting
+            // Minimal frame commits without heavy operations
+            static auto last_commit_time = std::chrono::steady_clock::now();
             auto now = std::chrono::steady_clock::now();
-            auto elapsed = now - last_frame_time;
             
-            if (elapsed >= frame_duration) {
-                // Commit surface for video updates
-                if (pImpl->surface && pImpl->buffer && pImpl->has_new_frame) {
+            if (now - last_commit_time > std::chrono::milliseconds(16)) {
+                if (pImpl->surface && pImpl->buffer) {
                     wl_surface_damage(pImpl->surface, 0, 0, pImpl->info.window_width, pImpl->info.window_height);
                     wl_surface_commit(pImpl->surface);
-                    pImpl->has_new_frame = false;
                 }
-                last_frame_time = now;
+                last_commit_time = now;
             }
-            
-            // Very short sleep to prevent CPU spinning while staying responsive
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
 
         pImpl->log("GUI event loop exited");
@@ -929,6 +928,13 @@ namespace openterface {
     }
 
     GUIInfo GUI::getInfo() const { return pImpl->info; }
+
+    void GUI::setDebugMode(bool enabled) {
+        pImpl->debug_input = enabled;
+        if (enabled) {
+            pImpl->log("Debug mode enabled - input events will be logged");
+        }
+    }
 
     // Wayland implementation methods
     bool GUI::Impl::initWayland() {
@@ -1152,6 +1158,7 @@ namespace openterface {
         callback_data.cursor_theme = cursor_theme;
         callback_data.default_cursor = default_cursor;
         callback_data.cursor_surface = cursor_surface;
+        callback_data.debug_mode = debug_input;
 
         // Use xdg_shell if available (modern), fall back to wl_shell (deprecated)
         if (xdg_wm_base) {

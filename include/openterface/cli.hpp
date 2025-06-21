@@ -24,8 +24,9 @@ namespace openterface {
         ::CLI::App app;
         bool verbose = false;
         bool dummy_mode = false;
-        std::string serial_port = "/dev/ttyACM0";
-        std::string video_device = "/dev/video0";
+        bool debug_input = false;
+        std::string serial_port;
+        std::string video_device;
 
         // Module instances
         std::unique_ptr<Serial> serial;

@@ -4,8 +4,6 @@ set(project_name openterface)
 project(${project_name} VERSION 0.1.0 LANGUAGES C CXX)
 
 add_compile_options(-Wall -Wextra -Wpedantic)
-cmake_policy(SET CMP0074 NEW)
-cmake_policy(SET CMP0135 NEW)
 set(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake" ${CMAKE_MODULE_PATH})
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED On)

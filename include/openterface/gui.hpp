@@ -58,6 +58,9 @@ namespace openterface {
         int runEventLoop(); // Blocking call
         void requestExit();
 
+        // Debug
+        void setDebugMode(bool enabled);
+
         // Status
         GUIInfo getInfo() const;
 
