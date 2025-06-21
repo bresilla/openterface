@@ -14,11 +14,14 @@
 #include "wayland/xdg-shell-client-protocol.h"
 #include <fcntl.h>
 #include <string.h>
+#include <cstring>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <wayland-client.h>
 #include <wayland-cursor.h>
 #include <errno.h>
+#include <poll.h>
 
 // For memfd_create
 #include <sys/syscall.h>
@@ -81,6 +84,10 @@ namespace openterface {
 
     // XDG shell callbacks
     static void xdg_wm_base_ping(void *data, struct xdg_wm_base *xdg_wm_base, uint32_t serial) {
+        auto *callback_data = static_cast<WaylandCallbackData *>(data);
+        if (callback_data && callback_data->log_func) {
+            callback_data->log_func("Received XDG ping, sending pong (serial=" + std::to_string(serial) + ")");
+        }
         xdg_wm_base_pong(xdg_wm_base, serial);
     }
 
@@ -239,6 +246,13 @@ namespace openterface {
         std::atomic<bool> resize_in_progress{false};
         std::chrono::steady_clock::time_point last_resize_time;
 
+        // Video frame storage
+        std::vector<uint8_t> current_frame;
+        std::mutex frame_mutex;
+        int frame_width = 0;
+        int frame_height = 0;
+        bool has_new_frame = false;
+
         WaylandCallbackData callback_data;
 
         void log(const std::string &msg) {
@@ -252,6 +266,7 @@ namespace openterface {
         bool createWaylandWindow();
         bool createBuffer(int width, int height);
         void destroyBuffer();
+        void onVideoFrame(const FrameData& frame);
     };
 
     // Simple input callbacks using callback data
@@ -723,12 +738,19 @@ namespace openterface {
 
         pImpl->log("Starting video display");
 
-        // In a real implementation, this would:
-        // 1. Set up frame callback from video source
-        // 2. Create rendering surface (OpenGL/Vulkan/etc.)
-        // 3. Start rendering loop
+        // Set up frame callback from video source
+        pImpl->video->setFrameCallback([this](const FrameData& frame) {
+            pImpl->onVideoFrame(frame);
+        });
+
+        // Start video capture
+        if (!pImpl->video->startCapture()) {
+            pImpl->log("Failed to start video capture");
+            return false;
+        }
 
         pImpl->info.video_displayed = true;
+        pImpl->log("Video display and capture started successfully");
         return true;
     }
 
@@ -808,75 +830,93 @@ namespace openterface {
     int GUI::runEventLoop() {
         pImpl->log("Starting Wayland event loop");
 
+        // Prepare for polling
+        struct pollfd fds[1];
+        fds[0].fd = wl_display_get_fd(pImpl->display);
+        fds[0].events = POLLIN;
+
+        auto last_frame_time = std::chrono::steady_clock::now();
+        const auto frame_duration = std::chrono::milliseconds(16); // Target 60 FPS
+
         // Wayland event loop
         while (!pImpl->exit_requested && pImpl->display) {
-            // Check if window needs to be resized
-            if (pImpl->needs_resize && pImpl->surface) {
-                // Use lock guard to prevent race conditions
-                std::lock_guard<std::mutex> lock(pImpl->resize_mutex);
-                
-                // Double-check after acquiring lock
-                if (!pImpl->needs_resize) {
-                    continue;
-                }
-                
-                // Check if another resize is already in progress
-                if (pImpl->resize_in_progress.load()) {
-                    pImpl->log("Resize already in progress, skipping");
-                    continue;
-                }
-                
-                pImpl->resize_in_progress = true;
-                
-                pImpl->log("Handling window resize to " + std::to_string(pImpl->info.window_width) + 
-                          "x" + std::to_string(pImpl->info.window_height));
-                
-                // Validate dimensions before proceeding
-                if (pImpl->info.window_width <= 0 || pImpl->info.window_height <= 0 || 
-                    pImpl->info.window_width > 8192 || pImpl->info.window_height > 8192) {
-                    pImpl->log("Invalid resize dimensions, skipping");
-                    pImpl->needs_resize = false;
-                    pImpl->resize_in_progress = false;
-                    continue;
-                }
-                
-                try {
-                    // Destroy old buffer
-                    pImpl->destroyBuffer();
-                    
-                    // Create new buffer with new size
-                    if (pImpl->createBuffer(pImpl->info.window_width, pImpl->info.window_height)) {
-                        // Attach new buffer and damage the surface
-                        if (pImpl->surface && pImpl->buffer) {
-                            wl_surface_attach(pImpl->surface, pImpl->buffer, 0, 0);
-                            wl_surface_damage(pImpl->surface, 0, 0, pImpl->info.window_width, pImpl->info.window_height);
-                            wl_surface_commit(pImpl->surface);
-                            pImpl->log("Buffer resized to " + std::to_string(pImpl->info.window_width) + 
-                                      "x" + std::to_string(pImpl->info.window_height) + " and committed");
-                        } else {
-                            pImpl->log("Error: Missing surface or buffer for commit");
-                        }
-                    } else {
-                        pImpl->log("Failed to create resized buffer");
-                    }
-                } catch (const std::exception& e) {
-                    pImpl->log("Exception during resize: " + std::string(e.what()));
-                } catch (...) {
-                    pImpl->log("Unknown exception during resize");
-                }
-                
-                pImpl->needs_resize = false;
-                pImpl->resize_in_progress = false;
+            // First, dispatch any pending events immediately
+            // This ensures ping/pong and other protocol messages are handled ASAP
+            while (wl_display_prepare_read(pImpl->display) != 0) {
+                wl_display_dispatch_pending(pImpl->display);
             }
             
-            // Handle Wayland events
-            if (wl_display_dispatch(pImpl->display) == -1) {
-                pImpl->log("Wayland display dispatch failed");
+            // Flush any pending requests to the compositor
+            if (wl_display_flush(pImpl->display) < 0 && errno != EAGAIN) {
+                pImpl->log("Error flushing display: " + std::string(strerror(errno)));
+                wl_display_cancel_read(pImpl->display);
                 break;
             }
             
-            // Small sleep to prevent excessive CPU usage
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            // Poll with a short timeout to stay responsive
+            int ret = poll(fds, 1, 5); // 5ms timeout for responsiveness
+            
+            if (ret > 0) {
+                // Events are available, read them
+                wl_display_read_events(pImpl->display);
+            } else {
+                // No events, cancel the read
+                wl_display_cancel_read(pImpl->display);
+            }
+            
+            // Dispatch all pending events
+            wl_display_dispatch_pending(pImpl->display);
+            
+            // Handle resize in a non-blocking way
+            if (pImpl->needs_resize && pImpl->surface) {
+                // Try to acquire lock without blocking
+                std::unique_lock<std::mutex> lock(pImpl->resize_mutex, std::try_to_lock);
+                if (lock.owns_lock() && pImpl->needs_resize && !pImpl->resize_in_progress.load()) {
+                    pImpl->resize_in_progress = true;
+                    
+                    // Validate dimensions
+                    if (pImpl->info.window_width > 0 && pImpl->info.window_height > 0 && 
+                        pImpl->info.window_width <= 8192 && pImpl->info.window_height <= 8192) {
+                        
+                        pImpl->log("Handling window resize to " + std::to_string(pImpl->info.window_width) + 
+                                  "x" + std::to_string(pImpl->info.window_height));
+                        
+                        try {
+                            // Quick buffer swap
+                            pImpl->destroyBuffer();
+                            if (pImpl->createBuffer(pImpl->info.window_width, pImpl->info.window_height)) {
+                                if (pImpl->surface && pImpl->buffer) {
+                                    wl_surface_attach(pImpl->surface, pImpl->buffer, 0, 0);
+                                    wl_surface_damage(pImpl->surface, 0, 0, pImpl->info.window_width, pImpl->info.window_height);
+                                    wl_surface_commit(pImpl->surface);
+                                }
+                            }
+                        } catch (...) {
+                            pImpl->log("Error during resize");
+                        }
+                    }
+                    
+                    pImpl->needs_resize = false;
+                    pImpl->resize_in_progress = false;
+                }
+            }
+            
+            // Frame rate limiting
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = now - last_frame_time;
+            
+            if (elapsed >= frame_duration) {
+                // Commit surface for video updates
+                if (pImpl->surface && pImpl->buffer && pImpl->has_new_frame) {
+                    wl_surface_damage(pImpl->surface, 0, 0, pImpl->info.window_width, pImpl->info.window_height);
+                    wl_surface_commit(pImpl->surface);
+                    pImpl->has_new_frame = false;
+                }
+                last_frame_time = now;
+            }
+            
+            // Very short sleep to prevent CPU spinning while staying responsive
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
 
         pImpl->log("GUI event loop exited");
@@ -923,10 +963,11 @@ namespace openterface {
         std::cout << "DEBUG: About to add registry listener" << std::endl;
         wl_registry_add_listener(registry, &registry_listener, &callback_data);
 
-        // Roundtrip to get globals
-        std::cout << "DEBUG: About to do roundtrip" << std::endl;
-        wl_display_roundtrip(display);
-        std::cout << "DEBUG: Roundtrip completed" << std::endl;
+        // Process registry events to get globals
+        std::cout << "DEBUG: About to process registry events" << std::endl;
+        wl_display_flush(display);
+        wl_display_dispatch(display);
+        std::cout << "DEBUG: Registry events processed" << std::endl;
 
         // Copy results back from callback data
         std::cout << "DEBUG: Copying results from callback data" << std::endl;
@@ -946,8 +987,9 @@ namespace openterface {
             log("Setting up seat listener for input capabilities");
             wl_seat_add_listener(seat, &simple_seat_listener, &callback_data);
 
-            // Trigger another roundtrip to get seat capabilities
-            wl_display_roundtrip(display);
+            // Process seat events without blocking
+            wl_display_flush(display);
+            wl_display_dispatch_pending(display);
             log("Seat listener setup complete");
         }
         
@@ -1160,8 +1202,9 @@ namespace openterface {
             // Commit surface to trigger initial configure
             wl_surface_commit(surface);
 
-            // Wait for configure event
-            wl_display_roundtrip(display);
+            // Process initial configure events without blocking
+            wl_display_flush(display);
+            wl_display_dispatch_pending(display);
 
             // Create buffer with content
             if (!createBuffer(info.window_width, info.window_height)) {
@@ -1271,34 +1314,64 @@ namespace openterface {
             return false;
         }
 
-        // Fill buffer with a gradient pattern to make scaling visible
+        // Fill buffer with video frame data or gradient pattern
         uint32_t *pixels = static_cast<uint32_t *>(shm_data);
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                int idx = y * width + x;
+        
+        {
+            std::lock_guard<std::mutex> lock(frame_mutex);
+            
+            if (has_new_frame && !current_frame.empty() && frame_width > 0 && frame_height > 0) {
+                // Display indicator that video frames are being received
+                log("Rendering video frame indicator: " + std::to_string(frame_width) + "x" + std::to_string(frame_height) + 
+                    " (" + std::to_string(current_frame.size()) + " bytes MJPEG)");
                 
-                // Create a gradient pattern to help visualize scaling
-                uint8_t red = static_cast<uint8_t>((x * 255) / (width - 1));
-                uint8_t green = static_cast<uint8_t>((y * 255) / (height - 1));
-                uint8_t blue = 64; // Constant blue component
+                // Create a visual indicator that video is being received
+                // This creates a animated pattern to show frames are coming in
+                static uint8_t frame_counter = 0;
+                frame_counter += 10;
                 
-                // XRGB8888 format: 0xAARRGGBB
-                pixels[idx] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
+                for (int y = 0; y < height; y++) {
+                    for (int x = 0; x < width; x++) {
+                        int dst_idx = y * width + x;
+                        
+                        // Create a pattern that changes with each frame to show video activity
+                        uint8_t red = static_cast<uint8_t>((x + frame_counter) % 256);
+                        uint8_t green = static_cast<uint8_t>((y + frame_counter) % 256);
+                        uint8_t blue = frame_counter;
+                        
+                        // XRGB8888 format: 0xAARRGGBB
+                        pixels[dst_idx] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
+                    }
+                }
+                
+                has_new_frame = false; // Mark frame as processed
+                log("Video frame indicator rendered (MJPEG decoding needed for actual video)");
+            } else {
+                // Fill with gradient pattern as fallback
+                for (int y = 0; y < height; y++) {
+                    for (int x = 0; x < width; x++) {
+                        int idx = y * width + x;
+                        
+                        // Create a gradient pattern to help visualize scaling
+                        uint8_t red = static_cast<uint8_t>((x * 255) / (width - 1));
+                        uint8_t green = static_cast<uint8_t>((y * 255) / (height - 1));
+                        uint8_t blue = 64; // Constant blue component
+                        
+                        // XRGB8888 format: 0xAARRGGBB
+                        pixels[idx] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
+                    }
+                }
+                log("No video frame available, using gradient pattern");
             }
         }
 
-        log("Buffer created successfully with gradient pattern");
+        log("Buffer created successfully");
         return true;
     }
 
     void GUI::Impl::destroyBuffer() {
+        std::lock_guard<std::mutex> lock(resize_mutex);
         log("Destroying buffer...");
-        
-        // Store the size for munmap
-        int buffer_size = 0;
-        if (info.window_width > 0 && info.window_height > 0) {
-            buffer_size = info.window_width * info.window_height * 4;
-        }
         
         // Destroy Wayland buffer first
         if (buffer) {
@@ -1307,17 +1380,24 @@ namespace openterface {
             log("Wayland buffer destroyed");
         }
 
-        // Unmap shared memory
+        // Unmap shared memory using the original size from when it was mapped
         if (shm_data && shm_data != MAP_FAILED) {
-            if (buffer_size > 0) {
-                int result = munmap(shm_data, buffer_size);
+            // Use fstat to get the actual file size instead of calculating from window dimensions
+            struct stat sb;
+            if (shm_fd != -1 && fstat(shm_fd, &sb) == 0) {
+                int result = munmap(shm_data, sb.st_size);
                 if (result != 0) {
                     log("Warning: munmap failed: " + std::string(strerror(errno)));
                 } else {
                     log("Shared memory unmapped successfully");
                 }
             } else {
-                log("Warning: Cannot determine buffer size for munmap");
+                log("Warning: Cannot determine buffer size, attempting graceful cleanup");
+                // Fallback: unmap with current calculated size but this is less safe
+                int buffer_size = info.window_width * info.window_height * 4;
+                if (buffer_size > 0) {
+                    munmap(shm_data, buffer_size);
+                }
             }
             shm_data = nullptr;
         }
@@ -1330,6 +1410,31 @@ namespace openterface {
         }
         
         log("Buffer destruction complete");
+    }
+
+    void GUI::Impl::onVideoFrame(const FrameData& frame) {
+        std::lock_guard<std::mutex> lock(frame_mutex);
+        
+        // Store the frame data
+        if (frame.data && frame.size > 0) {
+            static int frame_count = 0;
+            frame_count++;
+            
+            // Only log every 30 frames to reduce spam
+            if (frame_count % 30 == 1) {
+                log("Video frame " + std::to_string(frame_count) + ": " + std::to_string(frame.width) + "x" + std::to_string(frame.height) + 
+                    " size=" + std::to_string(frame.size) + " bytes");
+            }
+            
+            current_frame.resize(frame.size);
+            memcpy(current_frame.data(), frame.data, frame.size);
+            frame_width = frame.width;
+            frame_height = frame.height;
+            has_new_frame = true;
+            
+            // Force buffer recreation and surface update
+            needs_resize = true;
+        }
     }
 
     // Wayland registry callbacks

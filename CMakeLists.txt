@@ -30,7 +30,7 @@ set(ext_deps)
 FetchContent_Declare(
     cli11
     GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
-    GIT_TAG v2.3.2
+    GIT_TAG main
 )
 FetchContent_MakeAvailable(cli11)
 list(APPEND ext_deps CLI11::CLI11)
