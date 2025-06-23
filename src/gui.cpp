@@ -1139,15 +1139,33 @@ namespace openterface {
                 
                 // Check if position changed
                 if (current_x != last_processed_x || current_y != last_processed_y) {
-                    int delta_x = current_x - last_processed_x;
-                    int delta_y = current_y - last_processed_y;
-                    
-                    // Forward mouse movement (this can block but it's in separate thread)
-                    if (serial && serial->isConnected() && (delta_x != 0 || delta_y != 0)) {
-                        serial->sendMouseMove(delta_x, delta_y, false);
+                    // Forward mouse movement using ABSOLUTE coordinates (same as clicks!)
+                    if (serial && serial->isConnected()) {
+                        // Get window and video dimensions for coordinate transformation
+                        int window_width = info.window_width;
+                        int window_height = info.window_height;
+                        int video_width = (current_frame.width > 0) ? current_frame.width : window_width;
+                        int video_height = (current_frame.height > 0) ? current_frame.height : window_height;
+                        
+                        // Use the same coordinate normalization as mouse clicks
+                        // Clamp to window bounds
+                        int clamped_x = std::max(0, std::min(current_x, window_width - 1));
+                        int clamped_y = std::max(0, std::min(current_y, window_height - 1));
+                        
+                        // CH9329 coordinate mapping: Direct scaling from window to 0-4095 range
+                        int ch9329_x = static_cast<int>((static_cast<double>(clamped_x) / (window_width - 1)) * 4095);
+                        int ch9329_y = static_cast<int>((static_cast<double>(clamped_y) / (window_height - 1)) * 4095);
+                        
+                        // Clamp to CH9329 coordinate bounds (0-4095)
+                        ch9329_x = std::max(0, std::min(ch9329_x, 4095));
+                        ch9329_y = std::max(0, std::min(ch9329_y, 4095));
+                        
+                        // Send ABSOLUTE coordinates (not relative!)
+                        serial->sendMouseMove(ch9329_x, ch9329_y, true);
                         if (debug_input) {
-                            log("[INPUT] Mouse motion forwarded: (" + 
-                                std::to_string(delta_x) + ", " + std::to_string(delta_y) + ")");
+                            log("[INPUT] Mouse motion forwarded (ABSOLUTE): window(" + 
+                                std::to_string(current_x) + "," + std::to_string(current_y) + 
+                                ") -> CH9329(" + std::to_string(ch9329_x) + "," + std::to_string(ch9329_y) + ")");
                         }
                     }
                     
