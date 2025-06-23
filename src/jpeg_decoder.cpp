@@ -76,13 +76,43 @@ bool JpegDecoder::decode(const uint8_t* jpeg_data, size_t jpeg_size, DecodedFram
         return false;
     }
 
+    // Validate decoded dimensions
+    if (cinfo.output_width <= 0 || cinfo.output_height <= 0) {
+        last_error = "Invalid JPEG dimensions: " + std::to_string(cinfo.output_width) + "x" + std::to_string(cinfo.output_height);
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+    
+    // Reasonable size limits to prevent memory issues
+    if (cinfo.output_width > 8192 || cinfo.output_height > 8192) {
+        last_error = "JPEG dimensions too large: " + std::to_string(cinfo.output_width) + "x" + std::to_string(cinfo.output_height);
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+    
+    // Validate output components (should be 3 for RGB)
+    if (cinfo.output_components != 3) {
+        last_error = "Unexpected JPEG output components: " + std::to_string(cinfo.output_components) + " (expected 3 for RGB)";
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+
     // Allocate output buffer
     output.width = cinfo.output_width;
     output.height = cinfo.output_height;
     output.channels = cinfo.output_components;
     
     int row_stride = output.width * output.channels;
-    output.rgb_data.resize(output.height * row_stride);
+    
+    // Validate calculated buffer size
+    size_t buffer_size = static_cast<size_t>(output.height) * static_cast<size_t>(row_stride);
+    if (buffer_size > 200 * 1024 * 1024) { // 200MB limit
+        last_error = "JPEG buffer size too large: " + std::to_string(buffer_size) + " bytes";
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+    
+    output.rgb_data.resize(buffer_size);
 
     // Read scanlines
     JSAMPROW row_pointers[1];

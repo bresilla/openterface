@@ -258,6 +258,10 @@ namespace openterface {
         void *shm_data = nullptr;
         int shm_fd = -1;
         bool needs_resize = false;
+        
+        // Buffer dimensions (separate from window dimensions)
+        int buffer_width = 0;
+        int buffer_height = 0;
 
         // Synchronization
         std::mutex resize_mutex;
@@ -1170,33 +1174,81 @@ namespace openterface {
                                                " (" + std::to_string(pImpl->frame_width) + "x" + std::to_string(pImpl->frame_height) + ")");
                                 }
                                 
-                                // Calculate scaling to fit video into window while maintaining aspect ratio
-                                float scale_x = (float)pImpl->info.window_width / (float)pImpl->frame_width;
-                                float scale_y = (float)pImpl->info.window_height / (float)pImpl->frame_height;
+                                // Calculate scaling to fit video into buffer while maintaining aspect ratio
+                                float scale_x = (float)pImpl->buffer_width / (float)pImpl->frame_width;
+                                float scale_y = (float)pImpl->buffer_height / (float)pImpl->frame_height;
                                 float scale = std::min(scale_x, scale_y);
                                 
                                 int scaled_width = (int)((float)pImpl->frame_width * scale);
                                 int scaled_height = (int)((float)pImpl->frame_height * scale);
-                                int offset_x = (pImpl->info.window_width - scaled_width) / 2;
-                                int offset_y = (pImpl->info.window_height - scaled_height) / 2;
+                                int offset_x = (pImpl->buffer_width - scaled_width) / 2;
+                                int offset_y = (pImpl->buffer_height - scaled_height) / 2;
                                 
-                                // DISABLE MEMSET - this might be causing the crash
-                                // memset disabled to isolate the issue
+                                // Clear the entire allocated buffer to black before drawing video
+                                // Use actual buffer dimensions to avoid memset overflow
+                                if (pImpl->buffer_width > 0 && pImpl->buffer_height > 0) {
+                                    size_t buffer_size = pImpl->buffer_width * pImpl->buffer_height * 4;
+                                    memset(pixels, 0, buffer_size);
+                                } else {
+                                    pImpl->log("Warning: Invalid buffer dimensions for memset");
+                                }
                                 
-                                // EXTREMELY SIMPLE: just copy top-left corner without any scaling
-                                int copy_width = std::min(640, std::min(pImpl->frame_width, pImpl->info.window_width));
-                                int copy_height = std::min(480, std::min(pImpl->frame_height, pImpl->info.window_height));
+                                // Calculate safe copy dimensions using actual buffer dimensions
+                                int copy_width = std::min(pImpl->frame_width, pImpl->buffer_width);
+                                int copy_height = std::min(pImpl->frame_height, pImpl->buffer_height);
                                 
-                                for (int y = 0; y < copy_height; y++) {
-                                    for (int x = 0; x < copy_width; x++) {
-                                        int dst_idx = y * pImpl->info.window_width + x;
-                                        int src_idx = (y * pImpl->frame_width + x) * 3;
-                                        
-                                        uint8_t red = rgb_data[src_idx];
-                                        uint8_t green = rgb_data[src_idx + 1];
-                                        uint8_t blue = rgb_data[src_idx + 2];
-                                        
-                                        pixels[dst_idx] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
+                                // Apply proper scaling using the calculated dimensions
+                                if (pImpl->frame_width > 0 && pImpl->frame_height > 0 && 
+                                    scaled_width > 0 && scaled_height > 0) {
+                                    
+                                    // Use scaled dimensions if they fit in the buffer
+                                    if (scaled_width <= pImpl->buffer_width && 
+                                        scaled_height <= pImpl->buffer_height) {
+                                        copy_width = scaled_width;
+                                        copy_height = scaled_height;
+                                    }
+                                    
+                                    // Center the video in the window
+                                    for (int y = 0; y < copy_height; y++) {
+                                        for (int x = 0; x < copy_width; x++) {
+                                            int dst_x = x + offset_x;
+                                            int dst_y = y + offset_y;
+                                            
+                                            // Bounds check for destination using buffer dimensions
+                                            if (dst_x >= 0 && dst_x < pImpl->buffer_width &&
+                                                dst_y >= 0 && dst_y < pImpl->buffer_height) {
+                                                
+                                                // Map scaled coordinates back to source frame
+                                                int src_x = (x * pImpl->frame_width) / copy_width;
+                                                int src_y = (y * pImpl->frame_height) / copy_height;
+                                                
+                                                // Bounds check for source
+                                                if (src_x < pImpl->frame_width && src_y < pImpl->frame_height) {
+                                                    int dst_idx = dst_y * pImpl->buffer_width + dst_x;
+                                                    int src_idx = (src_y * pImpl->frame_width + src_x) * 3;
+                                                    
+                                                    uint8_t red = rgb_data[src_idx];
+                                                    uint8_t green = rgb_data[src_idx + 1];
+                                                    uint8_t blue = rgb_data[src_idx + 2];
+                                                    
+                                                    pixels[dst_idx] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Fallback: direct copy without scaling
+                                    for (int y = 0; y < copy_height; y++) {
+                                        for (int x = 0; x < copy_width; x++) {
+                                            int dst_idx = y * pImpl->buffer_width + x;
+                                            int src_idx = (y * pImpl->frame_width + x) * 3;
+                                            
+                                            uint8_t red = rgb_data[src_idx];
+                                            uint8_t green = rgb_data[src_idx + 1];
+                                            uint8_t blue = rgb_data[src_idx + 2];
+                                            
+                                            pixels[dst_idx] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
+                                        }
                                     }
                                 }
                             }
@@ -1589,6 +1641,10 @@ namespace openterface {
 
         log("Creating buffer: " + std::to_string(width) + "x" + std::to_string(height) +
             " (stride=" + std::to_string(stride) + ", size=" + std::to_string(size) + " bytes)");
+        
+        // Store actual buffer dimensions
+        buffer_width = width;
+        buffer_height = height;
 
         // Create shared memory file
         shm_fd = create_memfd("openterface-buffer", MFD_CLOEXEC);
@@ -1644,26 +1700,52 @@ namespace openterface {
                 bool is_rgb_data = (current_frame.size() == frame_width * frame_height * 3);
                 
                 if (is_rgb_data) {
-                    // Render actual decoded RGB video data
+                    // Clear buffer to black before drawing video (use actual allocated size)
+                    memset(pixels, 0, size);
+                    
+                    // Calculate scaling to fit video into window while maintaining aspect ratio
+                    float scale_x = (float)width / (float)frame_width;
+                    float scale_y = (float)height / (float)frame_height;
+                    float scale = std::min(scale_x, scale_y);
+                    
+                    int scaled_width = (int)((float)frame_width * scale);
+                    int scaled_height = (int)((float)frame_height * scale);
+                    int offset_x = (width - scaled_width) / 2;
+                    int offset_y = (height - scaled_height) / 2;
+                    
+                    // Render actual decoded RGB video data with proper scaling
                     const uint8_t* rgb_data = current_frame.data();
                     
-                    for (int y = 0; y < std::min(height, frame_height); y++) {
-                        for (int x = 0; x < std::min(width, frame_width); x++) {
-                            int dst_idx = y * width + x;
-                            int src_idx = (y * frame_width + x) * 3; // RGB data is 3 bytes per pixel
+                    for (int y = 0; y < scaled_height; y++) {
+                        for (int x = 0; x < scaled_width; x++) {
+                            int dst_x = x + offset_x;
+                            int dst_y = y + offset_y;
                             
-                            if (src_idx >= 0 && src_idx + 2 < (int)current_frame.size() && 
-                                dst_idx >= 0 && dst_idx < width * height) {
-                                uint8_t red = rgb_data[src_idx];
-                                uint8_t green = rgb_data[src_idx + 1];
-                                uint8_t blue = rgb_data[src_idx + 2];
+                            // Bounds check for destination
+                            if (dst_x >= 0 && dst_x < width && dst_y >= 0 && dst_y < height) {
+                                // Map scaled coordinates back to source frame
+                                int src_x = (x * frame_width) / scaled_width;
+                                int src_y = (y * frame_height) / scaled_height;
                                 
-                                // XRGB8888 format: 0xAARRGGBB
-                                pixels[dst_idx] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
+                                // Bounds check for source
+                                if (src_x < frame_width && src_y < frame_height) {
+                                    int dst_idx = dst_y * width + dst_x;
+                                    int src_idx = (src_y * frame_width + src_x) * 3;
+                                    
+                                    if (src_idx >= 0 && src_idx + 2 < (int)current_frame.size() && 
+                                        dst_idx >= 0 && dst_idx < width * height) {
+                                        uint8_t red = rgb_data[src_idx];
+                                        uint8_t green = rgb_data[src_idx + 1];
+                                        uint8_t blue = rgb_data[src_idx + 2];
+                                        
+                                        // XRGB8888 format: 0xAARRGGBB
+                                        pixels[dst_idx] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
+                                    }
+                                }
                             }
                         }
                     }
-                    log("RGB video frame rendered successfully");
+                    log("RGB video frame rendered successfully with scaling");
                 } else {
                     // Fallback: show animated pattern for non-RGB data
                     static uint8_t frame_counter = 0;
@@ -1740,6 +1822,10 @@ namespace openterface {
             shm_fd = -1;
             log("File descriptor closed");
         }
+        
+        // Clear buffer dimensions
+        buffer_width = 0;
+        buffer_height = 0;
 
         log("Buffer destruction complete");
     }
