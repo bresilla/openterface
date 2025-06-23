@@ -2,6 +2,7 @@
 #include "openterface/input.hpp"
 #include "openterface/serial.hpp"
 #include "openterface/video.hpp"
+#include "openterface/jpeg_decoder.hpp"
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -269,9 +270,13 @@ namespace openterface {
         int frame_width = 0;
         int frame_height = 0;
         bool has_new_frame = false;
+        std::atomic<bool> frame_is_rgb{false};  // Track if current frame is valid RGB data
 
         // Debug mode
         bool debug_input = false;
+
+        // JPEG decoder for video frames
+        JpegDecoder jpeg_decoder;
 
         WaylandCallbackData callback_data;
 
@@ -1135,14 +1140,77 @@ namespace openterface {
                 }
             }
 
-            // Minimal frame commits without heavy operations
+            // Regular frame updates - update buffer content with new video frames
             static auto last_commit_time = std::chrono::steady_clock::now();
             auto now = std::chrono::steady_clock::now();
 
             if (now - last_commit_time > std::chrono::milliseconds(16)) {
-                if (pImpl->surface && pImpl->buffer) {
+                if (pImpl->surface && pImpl->buffer && pImpl->shm_data) {
+                    // Only process valid RGB frames to prevent segfault
+                    {
+                        std::lock_guard<std::mutex> lock(pImpl->frame_mutex);
+                        pImpl->log("DEBUG CHECK: has_new_frame=" + std::to_string(pImpl->has_new_frame) + 
+                                   " frame_is_rgb=" + std::to_string(pImpl->frame_is_rgb.load()) + 
+                                   " frame_size=" + std::to_string(pImpl->current_frame.size()) + 
+                                   " dims=" + std::to_string(pImpl->frame_width) + "x" + std::to_string(pImpl->frame_height));
+                        
+                        if (pImpl->has_new_frame && pImpl->frame_is_rgb && !pImpl->current_frame.empty() && 
+                            pImpl->frame_width > 0 && pImpl->frame_height > 0) {
+                            
+                            // Validate RGB data size
+                            size_t expected_rgb_size = (size_t)(pImpl->frame_width * pImpl->frame_height * 3);
+                            if (pImpl->current_frame.size() == expected_rgb_size) {
+                                
+                                uint32_t *pixels = static_cast<uint32_t *>(pImpl->shm_data);
+                                const uint8_t* rgb_data = pImpl->current_frame.data();
+                                
+                                static int render_count = 0;
+                                if (++render_count % 30 == 1) {
+                                    pImpl->log("RENDERING: RGB video frame #" + std::to_string(render_count) + 
+                                               " (" + std::to_string(pImpl->frame_width) + "x" + std::to_string(pImpl->frame_height) + ")");
+                                }
+                                
+                                // Calculate scaling to fit video into window while maintaining aspect ratio
+                                float scale_x = (float)pImpl->info.window_width / (float)pImpl->frame_width;
+                                float scale_y = (float)pImpl->info.window_height / (float)pImpl->frame_height;
+                                float scale = std::min(scale_x, scale_y);
+                                
+                                int scaled_width = (int)((float)pImpl->frame_width * scale);
+                                int scaled_height = (int)((float)pImpl->frame_height * scale);
+                                int offset_x = (pImpl->info.window_width - scaled_width) / 2;
+                                int offset_y = (pImpl->info.window_height - scaled_height) / 2;
+                                
+                                // DISABLE MEMSET - this might be causing the crash
+                                // memset disabled to isolate the issue
+                                
+                                // EXTREMELY SIMPLE: just copy top-left corner without any scaling
+                                int copy_width = std::min(640, std::min(pImpl->frame_width, pImpl->info.window_width));
+                                int copy_height = std::min(480, std::min(pImpl->frame_height, pImpl->info.window_height));
+                                
+                                for (int y = 0; y < copy_height; y++) {
+                                    for (int x = 0; x < copy_width; x++) {
+                                        int dst_idx = y * pImpl->info.window_width + x;
+                                        int src_idx = (y * pImpl->frame_width + x) * 3;
+                                        
+                                        uint8_t red = rgb_data[src_idx];
+                                        uint8_t green = rgb_data[src_idx + 1];
+                                        uint8_t blue = rgb_data[src_idx + 2];
+                                        
+                                        pixels[dst_idx] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
+                                    }
+                                }
+                            }
+                            
+                            pImpl->has_new_frame = false;
+                            pImpl->frame_is_rgb = false;
+                        }
+                    }
+                    
+                    // Force Wayland to notice our changes
+                    wl_surface_attach(pImpl->surface, pImpl->buffer, 0, 0);
                     wl_surface_damage(pImpl->surface, 0, 0, pImpl->info.window_width, pImpl->info.window_height);
                     wl_surface_commit(pImpl->surface);
+                    wl_display_flush(pImpl->display);
                 }
                 last_commit_time = now;
             }
@@ -1503,6 +1571,7 @@ namespace openterface {
     }
 
     bool GUI::Impl::createBuffer(int width, int height) {
+        log("DEBUG: createBuffer called! " + std::to_string(width) + "x" + std::to_string(height));
         // Validate dimensions
         if (width <= 0 || height <= 0) {
             log("Invalid buffer dimensions: " + std::to_string(width) + "x" + std::to_string(height));
@@ -1568,47 +1637,63 @@ namespace openterface {
             std::lock_guard<std::mutex> lock(frame_mutex);
 
             if (has_new_frame && !current_frame.empty() && frame_width > 0 && frame_height > 0) {
-                // Display indicator that video frames are being received
-                log("Rendering video frame indicator: " + std::to_string(frame_width) + "x" +
-                    std::to_string(frame_height) + " (" + std::to_string(current_frame.size()) + " bytes MJPEG)");
+                log("Rendering decoded video frame: " + std::to_string(frame_width) + "x" +
+                    std::to_string(frame_height) + " (" + std::to_string(current_frame.size()) + " bytes RGB)");
 
-                // Create a visual indicator that video is being received
-                // This creates a animated pattern to show frames are coming in
-                static uint8_t frame_counter = 0;
-                frame_counter += 10;
-
-                for (int y = 0; y < height; y++) {
-                    for (int x = 0; x < width; x++) {
-                        int dst_idx = y * width + x;
-
-                        // Create a pattern that changes with each frame to show video activity
-                        uint8_t red = static_cast<uint8_t>((x + frame_counter) % 256);
-                        uint8_t green = static_cast<uint8_t>((y + frame_counter) % 256);
-                        uint8_t blue = frame_counter;
-
-                        // XRGB8888 format: 0xAARRGGBB
-                        pixels[dst_idx] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
+                // Check if current_frame contains RGB data (should be width * height * 3 bytes)
+                bool is_rgb_data = (current_frame.size() == frame_width * frame_height * 3);
+                
+                if (is_rgb_data) {
+                    // Render actual decoded RGB video data
+                    const uint8_t* rgb_data = current_frame.data();
+                    
+                    for (int y = 0; y < std::min(height, frame_height); y++) {
+                        for (int x = 0; x < std::min(width, frame_width); x++) {
+                            int dst_idx = y * width + x;
+                            int src_idx = (y * frame_width + x) * 3; // RGB data is 3 bytes per pixel
+                            
+                            if (src_idx >= 0 && src_idx + 2 < (int)current_frame.size() && 
+                                dst_idx >= 0 && dst_idx < width * height) {
+                                uint8_t red = rgb_data[src_idx];
+                                uint8_t green = rgb_data[src_idx + 1];
+                                uint8_t blue = rgb_data[src_idx + 2];
+                                
+                                // XRGB8888 format: 0xAARRGGBB
+                                pixels[dst_idx] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
+                            }
+                        }
                     }
+                    log("RGB video frame rendered successfully");
+                } else {
+                    // Fallback: show animated pattern for non-RGB data
+                    static uint8_t frame_counter = 0;
+                    frame_counter += 10;
+
+                    for (int y = 0; y < height; y++) {
+                        for (int x = 0; x < width; x++) {
+                            int dst_idx = y * width + x;
+
+                            uint8_t red = static_cast<uint8_t>((x + frame_counter) % 256);
+                            uint8_t green = static_cast<uint8_t>((y + frame_counter) % 256);
+                            uint8_t blue = frame_counter;
+
+                            pixels[dst_idx] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
+                        }
+                    }
+                    log("Fallback pattern rendered (non-RGB data)");
                 }
 
                 has_new_frame = false; // Mark frame as processed
-                log("Video frame indicator rendered (MJPEG decoding needed for actual video)");
             } else {
-                // Fill with gradient pattern as fallback
+                // Fill with black pattern instead of gradient so video can be visible
                 for (int y = 0; y < height; y++) {
                     for (int x = 0; x < width; x++) {
                         int idx = y * width + x;
-
-                        // Create a gradient pattern to help visualize scaling
-                        uint8_t red = static_cast<uint8_t>((x * 255) / (width - 1));
-                        uint8_t green = static_cast<uint8_t>((y * 255) / (height - 1));
-                        uint8_t blue = 64; // Constant blue component
-
-                        // XRGB8888 format: 0xAARRGGBB
-                        pixels[idx] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
+                        // Use black background so we can see video updates
+                        pixels[idx] = 0xFF000000; // Black with full alpha
                     }
                 }
-                log("No video frame available, using gradient pattern");
+                log("No video frame available, using black background");
             }
         }
 
@@ -1662,6 +1747,13 @@ namespace openterface {
     void GUI::Impl::onVideoFrame(const FrameData &frame) {
         std::lock_guard<std::mutex> lock(frame_mutex);
 
+        // ALWAYS clear previous frame data first to prevent stale data issues
+        has_new_frame = false;  // Set this FIRST to stop any rendering immediately
+        frame_is_rgb = false;   // Clear RGB flag FIRST 
+        current_frame.clear();
+        frame_width = 0;
+        frame_height = 0;
+
         // Store the frame data
         if (frame.data && frame.size > 0) {
             static int frame_count = 0;
@@ -1673,14 +1765,33 @@ namespace openterface {
                     std::to_string(frame.height) + " size=" + std::to_string(frame.size) + " bytes");
             }
 
-            current_frame.resize(frame.size);
-            memcpy(current_frame.data(), frame.data, frame.size);
-            frame_width = frame.width;
-            frame_height = frame.height;
-            has_new_frame = true;
+            // Try to decode MJPEG frame
+            DecodedFrame decoded_frame;
+            if (jpeg_decoder.decode(frame.data, frame.size, decoded_frame)) {
+                // Successfully decoded MJPEG to RGB
+                current_frame.resize(decoded_frame.rgb_data.size());
+                memcpy(current_frame.data(), decoded_frame.rgb_data.data(), decoded_frame.rgb_data.size());
+                frame_width = decoded_frame.width;
+                frame_height = decoded_frame.height;
+                has_new_frame = true;
+                frame_is_rgb = true;
+                
+                if (frame_count % 30 == 1) {
+                    log("MJPEG frame decoded successfully: " + std::to_string(decoded_frame.width) + "x" + 
+                        std::to_string(decoded_frame.height) + " RGB");
+                }
+            } else {
+                // MJPEG decode failed - clear all frame data to prevent processing
+                log("MJPEG decode failed: " + jpeg_decoder.getLastError() + ", clearing frame data");
+                current_frame.clear();
+                frame_width = 0;
+                frame_height = 0; 
+                has_new_frame = false;
+                frame_is_rgb = false;
+            }
 
-            // Force buffer recreation and surface update
-            needs_resize = true;
+            // Don't force buffer recreation - let event loop handle updates
+            // needs_resize = true;
         }
     }
 
