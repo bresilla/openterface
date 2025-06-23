@@ -58,18 +58,18 @@ namespace openterface {
         size_t buffer_size = buffer_width * buffer_height * 4;
         memset(pixels, 0, buffer_size);
 
-        // Calculate scaling to fit video into buffer while maintaining aspect ratio
+        // Calculate scaling to FILL the entire buffer (may stretch/warp to use full window)
         float scale_x = (float)buffer_width / (float)frame.width;
         float scale_y = (float)buffer_height / (float)frame.height;
-        float scale = std::min(scale_x, scale_y);
-
-        int scaled_width = (int)((float)frame.width * scale);
-        int scaled_height = (int)((float)frame.height * scale);
-        int offset_x = (buffer_width - scaled_width) / 2;
-        int offset_y = (buffer_height - scaled_height) / 2;
+        
+        // Use full window space - scale independently for X and Y axes
+        int scaled_width = buffer_width;   // Fill entire width
+        int scaled_height = buffer_height; // Fill entire height
+        int offset_x = 0; // No horizontal offset - use full width
+        int offset_y = 0; // No vertical offset - use full height
         
         // OPTIMIZATION: Use fast 1:1 copy when no scaling needed (like QT does)
-        if (scale >= 0.99f && scale <= 1.01f && 
+        if (scale_x >= 0.99f && scale_x <= 1.01f && scale_y >= 0.99f && scale_y <= 1.01f &&
             frame.width == buffer_width && frame.height == buffer_height) {
             // Direct copy - no scaling needed (fastest path)
             for (int y = 0; y < frame.height; y++) {

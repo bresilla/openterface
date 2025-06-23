@@ -6,6 +6,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <algorithm>
 
 namespace openterface {
 
@@ -145,6 +146,48 @@ namespace openterface {
         
         // Fallback: return 0 for unmapped keys
         return 0;
+    }
+    
+    // Normalize mouse coordinates to 4096x4096 space like the QT implementation
+    // This matches the original Qt approach for consistent mouse positioning
+    struct NormalizedCoords {
+        int x;
+        int y;
+    };
+    
+    // Check if mouse coordinates are over the video display area
+    bool isMouseOverVideo(int mouse_x, int mouse_y, int window_width, int window_height,
+                         int video_width, int video_height) {
+        if (video_width <= 0 || video_height <= 0) {
+            return true; // Assume mouse is over video if no video dimensions available
+        }
+        
+        // NEW: Video now fills the entire window (may be stretched/warped)
+        // So mouse is always over video if it's within window bounds
+        return (mouse_x >= 0 && mouse_x < window_width &&
+                mouse_y >= 0 && mouse_y < window_height);
+    }
+    
+    NormalizedCoords normalizeMouseCoordinates(int window_x, int window_y, 
+                                             int window_width, int window_height,
+                                             int video_width, int video_height) {
+        // NEW: Video fills entire window (may be stretched/warped)
+        // Direct mapping from window coordinates to CH9329 coordinates
+        
+        // Clamp to window bounds
+        int clamped_x = std::max(0, std::min(window_x, window_width - 1));
+        int clamped_y = std::max(0, std::min(window_y, window_height - 1));
+        
+        // CH9329 COORDINATE MAPPING: Direct scaling from window to 0-4095 range
+        // This gives us precise 1:1 mapping from window pixels to target coordinates
+        int ch9329_x = static_cast<int>((static_cast<double>(clamped_x) / (window_width - 1)) * 4095);
+        int ch9329_y = static_cast<int>((static_cast<double>(clamped_y) / (window_height - 1)) * 4095);
+        
+        // Clamp to CH9329 coordinate bounds (0-4095)
+        ch9329_x = std::max(0, std::min(ch9329_x, 4095));
+        ch9329_y = std::max(0, std::min(ch9329_y, 4095));
+        
+        return {ch9329_x, ch9329_y};
     }
 
     // Helper function to determine resize edge
@@ -286,8 +329,23 @@ namespace openterface {
         callback_data->last_mouse_x = x;
         callback_data->last_mouse_y = y;
         
-        // That's it! NO serial operations, NO logging, NO complex logic
-        // The input processing thread will poll these values
+        // DEBUG: Log absolute mouse position (throttled to avoid spam)
+        static int motion_counter = 0;
+        if (callback_data->debug_mode && callback_data->log_func && (motion_counter++ % 30 == 0)) {
+            // Get window and video dimensions for coordinate calculation
+            int window_width = callback_data->current_width ? *callback_data->current_width : 1920;
+            int window_height = callback_data->current_height ? *callback_data->current_height : 1080;
+            int video_width = callback_data->video_width_ptr ? *callback_data->video_width_ptr : window_width;
+            int video_height = callback_data->video_height_ptr ? *callback_data->video_height_ptr : window_height;
+            
+            // Calculate what CH9329 coordinates would be if we clicked here
+            // NOTE: With full-window video, mouse is always "over video"
+            auto coords = normalizeMouseCoordinates(x, y, window_width, window_height, video_width, video_height);
+            std::string pos_debug = "[DEBUG] Mouse position: window(" + std::to_string(x) + "," + std::to_string(y) + ")";
+            pos_debug += " -> CH9329(" + std::to_string(coords.x) + "," + std::to_string(coords.y) + "/4095)";
+            pos_debug += " [full-window video]";
+            callback_data->log_func(pos_debug);
+        }
 
         // Check if we're currently resizing
         if (callback_data->is_resizing) {
@@ -416,14 +474,71 @@ namespace openterface {
                 }
                 
                 if (button_num > 0) {
-                    // Forward to serial
+                    // Get window and video dimensions
+                    int window_width = callback_data->current_width ? *callback_data->current_width : 1920;
+                    int window_height = callback_data->current_height ? *callback_data->current_height : 1080;
+                    int video_width = callback_data->video_width_ptr ? *callback_data->video_width_ptr : 0;
+                    int video_height = callback_data->video_height_ptr ? *callback_data->video_height_ptr : 0;
+                    
+                    // DEBUG: Log all the dimensions we're working with
+                    if (callback_data->log_func) {
+                        std::string debug_msg = "[DEBUG] Mouse click debug: ";
+                        debug_msg += "window=" + std::to_string(window_width) + "x" + std::to_string(window_height);
+                        debug_msg += ", video=" + std::to_string(video_width) + "x" + std::to_string(video_height);
+                        debug_msg += ", mouse=(" + std::to_string(callback_data->last_mouse_x) + "," + std::to_string(callback_data->last_mouse_y) + ")";
+                        callback_data->log_func(debug_msg);
+                    }
+                    
+                    // If no video dimensions available, use window dimensions (fallback)
+                    if (video_width <= 0 || video_height <= 0) {
+                        if (callback_data->log_func) {
+                            callback_data->log_func("[DEBUG] No video dimensions, using window dimensions as fallback");
+                        }
+                        video_width = window_width;
+                        video_height = window_height;
+                    }
+                    
+                    // Only forward mouse events if mouse is over the video area
+                    if (!isMouseOverVideo(callback_data->last_mouse_x, callback_data->last_mouse_y,
+                                        window_width, window_height, video_width, video_height)) {
+                        if (callback_data->log_func) {
+                            callback_data->log_func("[INPUT] Mouse click outside video area - ignored");
+                        }
+                        return;
+                    }
+                    
+                    // Calculate coordinates for CH9329 (0-4095 range)
+                    auto normalized = normalizeMouseCoordinates(
+                        callback_data->last_mouse_x, 
+                        callback_data->last_mouse_y,
+                        window_width, 
+                        window_height,
+                        video_width,
+                        video_height
+                    );
+                    
+                    // DEBUG: Print all coordinate transformation steps
+                    if (callback_data->log_func) {
+                        std::string coord_debug = "[DEBUG] FULL-WINDOW coordinate transformation: ";
+                        coord_debug += "window(" + std::to_string(callback_data->last_mouse_x) + "," + std::to_string(callback_data->last_mouse_y) + ")";
+                        coord_debug += " -> CH9329(" + std::to_string(normalized.x) + "," + std::to_string(normalized.y) + ")";
+                        coord_debug += " | window_size=" + std::to_string(window_width) + "x" + std::to_string(window_height);
+                        coord_debug += " video_size=" + std::to_string(video_width) + "x" + std::to_string(video_height);
+                        coord_debug += " [video fills entire window]";
+                        callback_data->log_func(coord_debug);
+                    }
+                    
+                    // Forward to serial with normalized coordinates
                     bool success = serial->sendMouseButton(button_num, pressed, 
-                                                         callback_data->last_mouse_x, 
-                                                         callback_data->last_mouse_y, true);
+                                                         normalized.x, 
+                                                         normalized.y, true);
                     
                     if (callback_data->log_func) {
                         std::string msg = "[INPUT] Mouse button " + std::to_string(button_num) + 
-                                        (pressed ? " pressed" : " released") + " forwarded";
+                                        (pressed ? " pressed" : " released") + " forwarded: " +
+                                        "window(" + std::to_string(callback_data->last_mouse_x) + "," + std::to_string(callback_data->last_mouse_y) + ")" +
+                                        " -> CH9329(" + std::to_string(normalized.x) + "," + std::to_string(normalized.y) + "/4095)" +
+                                        " [video=" + std::to_string(video_width) + "x" + std::to_string(video_height) + "]";
                         if (!success) {
                             msg += " [FAILED]";
                         }

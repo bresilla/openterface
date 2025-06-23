@@ -676,6 +676,10 @@ namespace openterface {
         callback_data.keyboard_ptr = &keyboard;
         callback_data.input_ptr = &input;
         callback_data.serial_ptr = &serial;
+        
+        // Video frame dimensions for accurate mouse coordinate mapping
+        callback_data.video_width_ptr = &current_frame.width;
+        callback_data.video_height_ptr = &current_frame.height;
 
         // Use xdg_shell if available (modern), fall back to wl_shell (deprecated)
         if (xdg_wm_base) {
@@ -1014,11 +1018,19 @@ namespace openterface {
                         if (gpu_renderer.renderFrame(current_frame)) {
                             // GPU rendering is complete, no need for buffer swap
                             has_new_frame = false;
+                            if (debug_input) {
+                                log("[GPU] Frame rendered successfully (" + std::to_string(current_frame.width) + "x" + std::to_string(current_frame.height) + 
+                                    " -> " + std::to_string(info.window_width) + "x" + std::to_string(info.window_height) + ")");
+                            }
                         } else {
                             log("GPU rendering failed: " + gpu_renderer.getLastError());
                         }
                     } else if (shm_data && render_buffer) {
                         // CPU fallback rendering
+                        if (debug_input) {
+                            log("[CPU] Rendering frame (" + std::to_string(current_frame.width) + "x" + std::to_string(current_frame.height) + 
+                                " -> " + std::to_string(buffer_width) + "x" + std::to_string(buffer_height) + ")");
+                        }
                         renderVideoToBuffer(render_buffer, buffer_width, buffer_height, current_frame);
                         
                         // Signal that buffer is ready for swap IMMEDIATELY
@@ -1045,6 +1057,17 @@ namespace openterface {
             // Handle all Wayland events (ping-pong, input, etc) - this is critical for responsiveness
             wl_display_dispatch_pending(display);
             wl_display_flush(display);
+            
+            // CRITICAL: Handle window resize events for GPU renderer
+            if (needs_resize && use_gpu_acceleration) {
+                log("Processing GPU renderer resize to " + std::to_string(info.window_width) + "x" + std::to_string(info.window_height));
+                if (gpu_renderer.resize(info.window_width, info.window_height)) {
+                    log("GPU renderer resized successfully");
+                } else {
+                    log("GPU renderer resize failed: " + gpu_renderer.getLastError());
+                }
+                needs_resize = false;
+            }
             
             // PRIORITY: Check for video frame updates FREQUENTLY for smooth 30fps
             // Only handle CPU buffer swaps (GPU renders directly to surface)

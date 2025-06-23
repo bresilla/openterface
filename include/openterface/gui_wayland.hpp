@@ -73,6 +73,10 @@ namespace openterface {
         
         // Keyboard modifier tracking
         uint32_t current_modifiers = 0;
+        
+        // Video frame information for accurate mouse coordinate mapping
+        int *video_width_ptr = nullptr;
+        int *video_height_ptr = nullptr;
     };
 
     // Wayland protocol callbacks
