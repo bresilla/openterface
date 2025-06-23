@@ -259,7 +259,7 @@ namespace openterface {
     // Implementation of private methods
     bool Video::Impl::setupV4L2() {
 #ifdef __linux__
-        // Set format to MJPEG by default
+        // Set format to MJPEG by default with optimal settings
         struct v4l2_format fmt;
         memset(&fmt, 0, sizeof(fmt));
         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -270,16 +270,31 @@ namespace openterface {
             return false;
         }
 
-        // Try to set MJPEG format
+        // Set optimal format for 1920x1080 @ 30fps MJPEG
+        fmt.fmt.pix.width = 1920;
+        fmt.fmt.pix.height = 1080;
         fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+        fmt.fmt.pix.field = V4L2_FIELD_NONE;  // Progressive scan
+        fmt.fmt.pix.bytesperline = 0;         // Let driver calculate
+        fmt.fmt.pix.sizeimage = 0;            // Let driver calculate
+        
         if (ioctl(fd, VIDIOC_S_FMT, &fmt) == -1) {
-            log("MJPEG not supported, trying YUYV");
-            fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+            log("MJPEG 1920x1080 not supported, trying lower resolution");
+            fmt.fmt.pix.width = 1280;
+            fmt.fmt.pix.height = 720;
             if (ioctl(fd, VIDIOC_S_FMT, &fmt) == -1) {
-                log("Failed to set video format");
-                return false;
+                log("MJPEG not supported, trying YUYV");
+                fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+                fmt.fmt.pix.width = 1280;
+                fmt.fmt.pix.height = 720;
+                if (ioctl(fd, VIDIOC_S_FMT, &fmt) == -1) {
+                    log("Failed to set video format");
+                    return false;
+                }
+                info.format = "YUYV";
+            } else {
+                info.format = "MJPG";
             }
-            info.format = "YUYV";
         } else {
             info.format = "MJPG";
         }
@@ -287,7 +302,31 @@ namespace openterface {
         info.width = fmt.fmt.pix.width;
         info.height = fmt.fmt.pix.height;
 
-        log("Video format: " + info.format + " " + std::to_string(info.width) + "x" + std::to_string(info.height));
+        // Set frame rate to 30fps for optimal performance
+        struct v4l2_streamparm streamparm;
+        memset(&streamparm, 0, sizeof(streamparm));
+        streamparm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        
+        // Get current streaming parameters
+        if (ioctl(fd, VIDIOC_G_PARM, &streamparm) == 0) {
+            // Set to 30 fps
+            streamparm.parm.capture.timeperframe.numerator = 1;
+            streamparm.parm.capture.timeperframe.denominator = 30;
+            streamparm.parm.capture.capturemode = 0; // Normal capture mode
+            
+            if (ioctl(fd, VIDIOC_S_PARM, &streamparm) == -1) {
+                log("Warning: Failed to set frame rate to 30fps");
+            } else {
+                info.fps = streamparm.parm.capture.timeperframe.denominator / 
+                          streamparm.parm.capture.timeperframe.numerator;
+                log("Frame rate set to " + std::to_string(info.fps) + " fps");
+            }
+        } else {
+            log("Warning: Failed to get streaming parameters");
+        }
+
+        log("Video format: " + info.format + " " + std::to_string(info.width) + "x" + 
+            std::to_string(info.height) + " @ " + std::to_string(info.fps) + "fps");
 
         return true;
 #else
@@ -357,7 +396,7 @@ namespace openterface {
 
     void Video::Impl::captureLoop() {
 #ifdef __linux__
-        log("Capture loop started");
+        log("Capture loop started (30fps target)");
 
         while (capture_running) {
             fd_set fds;
@@ -366,19 +405,23 @@ namespace openterface {
             FD_ZERO(&fds);
             FD_SET(fd, &fds);
 
-            tv.tv_sec = 1;
-            tv.tv_usec = 0;
+            // Use much shorter timeout for real-time performance
+            // 33ms timeout (30fps = 33.33ms per frame)
+            tv.tv_sec = 0;
+            tv.tv_usec = 33333; // ~33ms timeout for 30fps
 
             int r = select(fd + 1, &fds, NULL, NULL, &tv);
             if (r == -1) {
                 if (errno == EINTR)
                     continue;
-                log("Select error");
+                log("Select error: " + std::string(strerror(errno)));
                 break;
             }
 
-            if (r == 0)
-                continue; // Timeout
+            if (r == 0) {
+                // Timeout - frame may not be ready yet, continue polling
+                continue;
+            }
 
             struct v4l2_buffer buf;
             memset(&buf, 0, sizeof(buf));
@@ -388,11 +431,11 @@ namespace openterface {
             if (ioctl(fd, VIDIOC_DQBUF, &buf) == -1) {
                 if (errno == EAGAIN)
                     continue;
-                log("Failed to dequeue buffer");
+                log("Failed to dequeue buffer: " + std::string(strerror(errno)));
                 break;
             }
 
-            // Process frame
+            // Process frame with minimal latency
             if (frame_callback && buf.index < buffers.size()) {
                 FrameData frame;
                 frame.data = static_cast<uint8_t *>(buffers[buf.index].start);
@@ -401,12 +444,13 @@ namespace openterface {
                 frame.height = info.height;
                 frame.timestamp = buf.timestamp.tv_sec * 1000000ULL + buf.timestamp.tv_usec;
 
+                // Call frame callback immediately for minimal latency
                 frame_callback(frame);
             }
 
-            // Requeue buffer
+            // Requeue buffer immediately
             if (ioctl(fd, VIDIOC_QBUF, &buf) == -1) {
-                log("Failed to requeue buffer");
+                log("Failed to requeue buffer: " + std::string(strerror(errno)));
                 break;
             }
         }

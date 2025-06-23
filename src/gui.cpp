@@ -987,33 +987,38 @@ namespace openterface {
 
     void GUI::Impl::waylandEventThreadFunction() {
         // CRITICAL: This thread must handle ALL Wayland events but NOT block on serial I/O
-        // The problem is that input callbacks do blocking serial writes
+        // Also prioritize video frame updates for smooth 30fps display
         
         while (thread_manager.wayland_thread_running.load() && display) {
             
-            // Handle all Wayland events (ping-pong, input, etc)
+            // Handle all Wayland events (ping-pong, input, etc) - this is critical for responsiveness
             wl_display_dispatch_pending(display);
             wl_display_flush(display);
             
-            // Check if we need to commit surface updates
+            // PRIORITY: Check for video frame updates FREQUENTLY for smooth 30fps
             if (thread_manager.buffer_swap_ready.load() && surface && buffer) {
                 wl_surface_attach(surface, buffer, 0, 0);
                 wl_surface_damage(surface, 0, 0, buffer_width, buffer_height);
                 wl_surface_commit(surface);
                 thread_manager.buffer_swap_ready = false;
+                
+                // Immediately flush after video frame commit for minimal latency
+                wl_display_flush(display);
             }
             
-            // Poll for new events
+            // Poll for new events with very short timeout to maintain responsiveness
             struct pollfd pfd;
             pfd.fd = wl_display_get_fd(display);
             pfd.events = POLLIN;
             
+            // Use non-blocking poll first
             if (poll(&pfd, 1, 0) > 0) {
                 wl_display_dispatch(display);
             }
             
-            // Minimal sleep
-            struct timespec ts = {0, 10000}; // 10 microseconds
+            // Ultra-minimal sleep to allow 30fps video updates (33ms per frame)
+            // Use nanosleep for sub-millisecond timing
+            struct timespec ts = {0, 1000000}; // 1ms sleep = 1000fps max update rate
             nanosleep(&ts, nullptr);
         }
     }
