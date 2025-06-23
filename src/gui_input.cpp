@@ -5,8 +5,147 @@
 #include <unistd.h>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 
 namespace openterface {
+
+    // Linux kernel scancode to USB HID keycode mapping table
+    static const std::unordered_map<uint32_t, uint8_t> linux_to_hid_keymap = {
+        // Function keys
+        {1, 0x29},   // ESC
+        {59, 0x3A},  // F1
+        {60, 0x3B},  // F2
+        {61, 0x3C},  // F3
+        {62, 0x3D},  // F4
+        {63, 0x3E},  // F5
+        {64, 0x3F},  // F6
+        {65, 0x40},  // F7
+        {66, 0x41},  // F8
+        {67, 0x42},  // F9
+        {68, 0x43},  // F10
+        {87, 0x44},  // F11
+        {88, 0x45},  // F12
+        
+        // Numbers row
+        {41, 0x35},  // ` ~
+        {2, 0x1E},   // 1 !
+        {3, 0x1F},   // 2 @
+        {4, 0x20},   // 3 #
+        {5, 0x21},   // 4 $
+        {6, 0x22},   // 5 %
+        {7, 0x23},   // 6 ^
+        {8, 0x24},   // 7 &
+        {9, 0x25},   // 8 *
+        {10, 0x26},  // 9 (
+        {11, 0x27},  // 0 )
+        {12, 0x2D},  // - _
+        {13, 0x2E},  // = +
+        {14, 0x2A},  // Backspace
+        
+        // QWERTY row
+        {15, 0x2B},  // Tab
+        {16, 0x14},  // Q
+        {17, 0x1A},  // W
+        {18, 0x08},  // E
+        {19, 0x15},  // R
+        {20, 0x17},  // T
+        {21, 0x1C},  // Y
+        {22, 0x18},  // U
+        {23, 0x0C},  // I
+        {24, 0x12},  // O
+        {25, 0x13},  // P
+        {26, 0x2F},  // [ {
+        {27, 0x30},  // ] }
+        {28, 0x28},  // Enter
+        
+        // ASDF row
+        {58, 0x39},  // Caps Lock
+        {30, 0x04},  // A
+        {31, 0x16},  // S
+        {32, 0x07},  // D
+        {33, 0x09},  // F
+        {34, 0x0A},  // G
+        {35, 0x0B},  // H
+        {36, 0x0D},  // J
+        {37, 0x0E},  // K
+        {38, 0x0F},  // L
+        {39, 0x33},  // ; :
+        {40, 0x34},  // ' "
+        {43, 0x32},  // \ |
+        
+        // ZXCV row
+        {42, 0xE1},  // Left Shift
+        {44, 0x1D},  // Z
+        {45, 0x1B},  // X
+        {46, 0x06},  // C
+        {47, 0x19},  // V
+        {48, 0x05},  // B
+        {49, 0x11},  // N
+        {50, 0x10},  // M
+        {51, 0x36},  // , <
+        {52, 0x37},  // . >
+        {53, 0x38},  // / ?
+        {54, 0xE5},  // Right Shift
+        
+        // Bottom row
+        {29, 0xE0},  // Left Ctrl
+        {125, 0xE3}, // Left Meta (Super)
+        {56, 0xE2},  // Left Alt
+        {57, 0x2C},  // Space
+        {100, 0xE6}, // Right Alt (AltGr)
+        {126, 0xE7}, // Right Meta (Super)
+        {127, 0x65}, // Menu
+        {97, 0xE4},  // Right Ctrl
+        
+        // Arrow keys
+        {103, 0x52}, // Up
+        {108, 0x51}, // Down
+        {105, 0x50}, // Left
+        {106, 0x4F}, // Right
+        
+        // Editing keys
+        {110, 0x49}, // Insert
+        {111, 0x4C}, // Delete
+        {102, 0x4A}, // Home
+        {107, 0x4D}, // End
+        {104, 0x4B}, // Page Up
+        {109, 0x4E}, // Page Down
+        
+        // Numeric keypad
+        {69, 0x53},  // Num Lock
+        {98, 0x54},  // Keypad /
+        {55, 0x55},  // Keypad *
+        {74, 0x56},  // Keypad -
+        {78, 0x57},  // Keypad +
+        {96, 0x58},  // Keypad Enter
+        {79, 0x59},  // Keypad 1
+        {80, 0x5A},  // Keypad 2
+        {81, 0x5B},  // Keypad 3
+        {75, 0x5C},  // Keypad 4
+        {76, 0x5D},  // Keypad 5
+        {77, 0x5E},  // Keypad 6
+        {71, 0x5F},  // Keypad 7
+        {72, 0x60},  // Keypad 8
+        {73, 0x61},  // Keypad 9
+        {82, 0x62},  // Keypad 0
+        {83, 0x63},  // Keypad .
+        
+        // Print Screen, Scroll Lock, Pause
+        {99, 0x46},  // Print Screen
+        {70, 0x47},  // Scroll Lock
+        {119, 0x48}, // Pause
+    };
+    
+    // Function to convert Linux keycode to USB HID keycode
+    uint8_t linux_keycode_to_hid(uint32_t linux_keycode) {
+        auto it = linux_to_hid_keymap.find(linux_keycode);
+        if (it != linux_to_hid_keymap.end()) {
+            return it->second;
+        }
+        
+        // Fallback: return 0 for unmapped keys
+        return 0;
+    }
 
     // Helper function to determine resize edge
     int get_resize_edge(int x, int y, int width, int height, int border_size) {
@@ -454,9 +593,25 @@ namespace openterface {
             
             // Check if input forwarding is enabled and serial is connected
             if (input->isForwardingEnabled() && serial->isConnected()) {
-                // Linux keycodes need +8 to convert to USB HID codes (roughly)
-                // This is a simplified mapping - a full implementation would use a proper keymap
-                int hid_keycode = key + 8;
+                // Convert Linux keycode to proper USB HID keycode using mapping table
+                uint8_t hid_keycode = linux_keycode_to_hid(key);
+                
+                // Skip unmapped keys
+                if (hid_keycode == 0) {
+                    if (callback_data->log_func) {
+                        callback_data->log_func("[INPUT] Unmapped key: " + std::to_string(key) + " (skipped)");
+                    }
+                    return;
+                }
+                
+                // Skip modifier keys - they're handled via the modifiers field, not as regular keys
+                if (hid_keycode >= 0xE0 && hid_keycode <= 0xE7) {
+                    if (callback_data->log_func) {
+                        callback_data->log_func("[INPUT] Modifier key " + std::to_string(hid_keycode) + 
+                                              " handled via modifiers field (not sent as regular key)");
+                    }
+                    return;
+                }
                 
                 // Convert Wayland modifiers to CH9329 format
                 int modifiers = 0;
@@ -468,7 +623,8 @@ namespace openterface {
                 if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
                     bool success = serial->sendKeyPress(hid_keycode, modifiers);
                     if (callback_data->log_func) {
-                        std::string msg = "[INPUT] Key press forwarded: " + std::to_string(hid_keycode);
+                        std::string msg = "[INPUT] Key press forwarded: " + std::to_string(hid_keycode) + 
+                                        " (Linux:" + std::to_string(key) + ")";
                         if (!success) {
                             msg += " [FAILED]";
                         }
@@ -477,7 +633,8 @@ namespace openterface {
                 } else {
                     bool success = serial->sendKeyRelease(hid_keycode, modifiers);
                     if (callback_data->log_func) {
-                        std::string msg = "[INPUT] Key release forwarded: " + std::to_string(hid_keycode);
+                        std::string msg = "[INPUT] Key release forwarded: " + std::to_string(hid_keycode) + 
+                                        " (Linux:" + std::to_string(key) + ")";
                         if (!success) {
                             msg += " [FAILED]";
                         }
