@@ -93,17 +93,23 @@ namespace openterface {
                     std::cout << "- Video capture disabled (no --video specified)" << std::endl;
                 }
 
-                // Connect serial if specified
+                // Connect serial if specified (async to avoid blocking GUI)
                 if (has_serial) {
-                    if (serial->connect(serial_port, 115200)) {
-                        std::cout << "✓ Serial connected" << std::endl;
-                        // Setup input forwarding only if serial is available
-                        input->setSerial(std::shared_ptr<Serial>(serial.get(), [](Serial *) {}));
-                    } else {
-                        std::cout << "✗ Serial connection failed" << std::endl;
-                        if (has_video) video->disconnect();
-                        return;
-                    }
+                    std::cout << "Connecting to serial port..." << std::endl;
+                    
+                    // Start async connection
+                    serial->connectAsync(serial_port, 115200, [this](bool success, const std::string& message) {
+                        if (success) {
+                            std::cout << "✓ Serial connected" << std::endl;
+                            // Setup input forwarding only if serial is available
+                            input->setSerial(std::shared_ptr<Serial>(serial.get(), [](Serial *) {}));
+                        } else {
+                            std::cout << "✗ Serial connection failed: " << message << std::endl;
+                        }
+                    });
+                    
+                    // Continue immediately without waiting - connection happens in background
+                    // This allows the GUI event loop to start and remain responsive
                 } else {
                     std::cout << "- Input forwarding disabled (no --serial specified)" << std::endl;
                 }

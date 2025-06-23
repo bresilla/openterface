@@ -62,6 +62,9 @@ namespace openterface {
         // Input forwarding control
         void setForwardingEnabled(bool enabled);
         bool isForwardingEnabled() const;
+        
+        // Mouse tracking control
+        void stopMouseTracking();
 
         // Manual input injection (for CLI commands)
         bool injectKeyPress(uint32_t key_code, uint32_t modifiers = 0);

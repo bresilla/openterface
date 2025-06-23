@@ -5,6 +5,9 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <thread>
+#include <atomic>
+#include <mutex>
 
 namespace openterface {
 
@@ -13,7 +16,11 @@ namespace openterface {
         int baudrate = 115200;
         bool connected = false;
         bool target_connected = false;
+        bool connecting = false;
     };
+
+    // Callback for connection status updates
+    using ConnectionCallback = std::function<void(bool success, const std::string& message)>;
 
     class Serial {
       public:
@@ -21,8 +28,10 @@ namespace openterface {
         ~Serial();
 
         bool connect(const std::string &port, int baudrate = 115200);
+        void connectAsync(const std::string &port, int baudrate = 115200, ConnectionCallback callback = nullptr);
         void disconnect();
         bool isConnected() const;
+        bool isConnecting() const;
 
         bool sendData(const std::vector<uint8_t> &data);
         std::vector<uint8_t> readData();

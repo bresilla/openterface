@@ -1,14 +1,20 @@
 #include "openterface/gui.hpp"
+#include "openterface/gui_wayland.hpp"
+#include "openterface/gui_input.hpp"
+#include "openterface/gui_video.hpp"
+#include "openterface/gui_threading.hpp"
 #include "openterface/input.hpp"
 #include "openterface/serial.hpp"
 #include "openterface/video.hpp"
 #include "openterface/jpeg_decoder.hpp"
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <thread>
 
 // Wayland includes
@@ -20,6 +26,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #include <wayland-client.h>
 #include <wayland-cursor.h>
@@ -41,180 +48,6 @@ namespace {
 } // namespace
 
 namespace openterface {
-
-    // Helper struct for Wayland callbacks
-    struct WaylandCallbackData {
-        struct wl_compositor *compositor = nullptr;
-        struct wl_shell *shell = nullptr;
-        struct wl_shm *shm = nullptr;
-        struct xdg_wm_base *xdg_wm_base = nullptr;
-        struct wl_seat *seat = nullptr;
-        std::function<void(const std::string &)> log_func;
-
-        // Input state tracking
-        bool mouse_over = false;
-        bool input_active = false;
-        bool debug_mode = false;
-
-        // Window and buffer management
-        struct wl_surface *surface = nullptr;
-        struct wl_buffer **buffer_ptr = nullptr;
-        void **shm_data_ptr = nullptr;
-        int *shm_fd_ptr = nullptr;
-        int *current_width = nullptr;
-        int *current_height = nullptr;
-        bool *needs_resize = nullptr;
-
-        // Resize state tracking
-        bool is_resizing = false;
-        int resize_edge = 0;
-        int last_mouse_x = 0;
-        int last_mouse_y = 0;
-
-        // Window objects for resize operations
-        struct xdg_toplevel *xdg_toplevel = nullptr;
-        uint32_t resize_serial = 0;
-
-        // Cursor objects
-        struct wl_cursor_theme *cursor_theme = nullptr;
-        struct wl_cursor *default_cursor = nullptr;
-        struct wl_surface *cursor_surface = nullptr;
-        
-        // Input objects - pointers to store them in the parent Impl
-        struct wl_pointer **pointer_ptr = nullptr;
-        struct wl_keyboard **keyboard_ptr = nullptr;
-        
-        // Input forwarding objects
-        std::shared_ptr<Input> *input_ptr = nullptr;
-        std::shared_ptr<Serial> *serial_ptr = nullptr;
-
-        // Resize constants
-        static constexpr int RESIZE_BORDER = 10; // 10px border for resize detection
-        
-        // Keyboard modifier tracking
-        uint32_t current_modifiers = 0;
-    };
-
-    // XDG shell callbacks
-    static void xdg_wm_base_ping(void *data, struct xdg_wm_base *xdg_wm_base, uint32_t serial) {
-        // Always respond to ping immediately - this is critical for window responsiveness
-        xdg_wm_base_pong(xdg_wm_base, serial);
-
-        auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        if (callback_data && callback_data->log_func) {
-            callback_data->log_func("[PING] Received XDG ping, sent pong (serial=" + std::to_string(serial) + ")");
-        }
-    }
-
-    static const struct xdg_wm_base_listener xdg_wm_base_listener = {
-        xdg_wm_base_ping,
-    };
-
-    static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface, uint32_t serial) {
-        xdg_surface_ack_configure(xdg_surface, serial);
-
-        // Commit the surface after acknowledging configure
-        auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        if (callback_data->log_func) {
-            callback_data->log_func("XDG surface configured");
-        }
-    }
-
-    static const struct xdg_surface_listener xdg_surface_listener = {
-        xdg_surface_configure,
-    };
-
-    static void xdg_toplevel_configure(void *data, struct xdg_toplevel *xdg_toplevel, int32_t width, int32_t height,
-                                       struct wl_array *states) {
-        // Handle window configure (resize, etc.)
-        auto *callback_data = static_cast<WaylandCallbackData *>(data);
-
-        // Add null pointer checks
-        if (!callback_data) {
-            return;
-        }
-
-        if (callback_data->log_func) {
-            std::string msg = "XDG toplevel configured: " + std::to_string(width) + "x" + std::to_string(height);
-            callback_data->log_func(msg);
-        }
-
-        // Validate pointers before dereferencing
-        if (!callback_data->current_width || !callback_data->current_height || !callback_data->needs_resize) {
-            if (callback_data->log_func) {
-                callback_data->log_func("Warning: Invalid callback data pointers in configure");
-            }
-            return;
-        }
-
-        // If we have valid dimensions and they're different from current size, trigger resize
-        if (width > 0 && height > 0 && width <= 4096 && height <= 4096) {
-            if (*callback_data->current_width != width || *callback_data->current_height != height) {
-                // Only update if we haven't resized very recently (prevent rapid resizes)
-                auto now = std::chrono::steady_clock::now();
-                static auto last_update = std::chrono::steady_clock::time_point{};
-                auto time_since_last = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update);
-
-                if (time_since_last.count() > 16) { // Limit to ~60 FPS
-                    *callback_data->current_width = width;
-                    *callback_data->current_height = height;
-                    *callback_data->needs_resize = true;
-                    last_update = now;
-                    if (callback_data->log_func) {
-                        callback_data->log_func("Window resize triggered: " + std::to_string(width) + "x" +
-                                                std::to_string(height));
-                    }
-                } else if (callback_data->log_func) {
-                    callback_data->log_func("Resize rate limited, skipping: " + std::to_string(width) + "x" +
-                                            std::to_string(height));
-                }
-            }
-        } else if (callback_data->log_func) {
-            callback_data->log_func("Warning: Invalid resize dimensions: " + std::to_string(width) + "x" +
-                                    std::to_string(height));
-        }
-    }
-
-    static void xdg_toplevel_close(void *data, struct xdg_toplevel *xdg_toplevel) {
-        // Handle window close request
-        auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        if (callback_data->log_func) {
-            callback_data->log_func("Window close requested");
-        }
-    }
-
-    static void xdg_toplevel_configure_bounds(void *data, struct xdg_toplevel *xdg_toplevel, int32_t width,
-                                              int32_t height) {
-        // Handle configure bounds
-        auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        if (callback_data->log_func) {
-            std::string msg = "XDG toplevel bounds: " + std::to_string(width) + "x" + std::to_string(height);
-            callback_data->log_func(msg);
-        }
-    }
-
-    static void xdg_toplevel_wm_capabilities(void *data, struct xdg_toplevel *xdg_toplevel,
-                                             struct wl_array *capabilities) {
-        // Handle WM capabilities
-        auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        if (callback_data->log_func) {
-            callback_data->log_func("XDG toplevel WM capabilities received");
-        }
-    }
-
-    static const struct xdg_toplevel_listener xdg_toplevel_listener = {
-        xdg_toplevel_configure,
-        xdg_toplevel_close,
-        xdg_toplevel_configure_bounds,
-        xdg_toplevel_wm_capabilities,
-    };
-
-    // Wayland registry callbacks
-    static void registry_global(void *data, struct wl_registry *registry, uint32_t id, const char *interface,
-                                uint32_t version);
-    static void registry_global_remove(void *data, struct wl_registry *registry, uint32_t id);
-
-    static const struct wl_registry_listener registry_listener = {registry_global, registry_global_remove};
 
     class GUI::Impl {
       public:
@@ -269,18 +102,26 @@ namespace openterface {
         std::chrono::steady_clock::time_point last_resize_time;
 
         // Video frame storage
-        std::vector<uint8_t> current_frame;
+        VideoFrame current_frame;
         std::mutex frame_mutex;
-        int frame_width = 0;
-        int frame_height = 0;
         bool has_new_frame = false;
-        std::atomic<bool> frame_is_rgb{false};  // Track if current frame is valid RGB data
 
         // Debug mode
         bool debug_input = false;
 
-        // JPEG decoder for video frames
-        JpegDecoder jpeg_decoder;
+        // Video processor for frame decoding
+        VideoProcessor video_processor;
+        
+        // Thread-safe surface update queue
+        SurfaceUpdateQueue surface_update_queue;
+
+        // Thread management
+        ThreadManager thread_manager;
+        void *render_buffer = nullptr;
+        
+        // Inter-thread communication queues
+        std::queue<InputEvent> input_queue;
+        std::mutex input_queue_mutex;
 
         WaylandCallbackData callback_data;
 
@@ -296,596 +137,12 @@ namespace openterface {
         bool createBuffer(int width, int height);
         void destroyBuffer();
         void onVideoFrame(const FrameData &frame);
+        void renderThreadFunction();
+        void waylandEventThreadFunction();
+        void inputThreadFunction();
+        void queueInputEvent(const InputEvent& event);
+        void processSurfaceUpdates();
     };
-
-    // Simple input callbacks using callback data
-    static void simple_seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabilities) {
-        auto *callback_data = static_cast<WaylandCallbackData *>(data);
-
-        if (callback_data->log_func) {
-            callback_data->log_func("🎯 Seat capabilities callback triggered!");
-            callback_data->log_func("🎯 Capabilities: " + std::to_string(capabilities));
-        }
-
-        // Forward declarations
-        extern const struct wl_pointer_listener debug_pointer_listener;
-        extern const struct wl_keyboard_listener debug_keyboard_listener;
-
-        if (capabilities & WL_SEAT_CAPABILITY_POINTER) {
-            struct wl_pointer *pointer = wl_seat_get_pointer(seat);
-            if (pointer && callback_data->log_func) {
-                callback_data->log_func("🖱️  Setting up mouse input capture");
-                wl_pointer_add_listener(pointer, &debug_pointer_listener, callback_data);
-                
-                // Store pointer in GUI::Impl for proper cleanup
-                if (callback_data->pointer_ptr) {
-                    *callback_data->pointer_ptr = pointer;
-                    callback_data->log_func("🖱️  Mouse pointer stored for cleanup");
-                }
-            }
-        }
-
-        if (capabilities & WL_SEAT_CAPABILITY_KEYBOARD) {
-            struct wl_keyboard *keyboard = wl_seat_get_keyboard(seat);
-            if (keyboard && callback_data->log_func) {
-                callback_data->log_func("⌨️  Setting up keyboard input capture");
-                wl_keyboard_add_listener(keyboard, &debug_keyboard_listener, callback_data);
-                
-                // Store keyboard in GUI::Impl for proper cleanup
-                if (callback_data->keyboard_ptr) {
-                    *callback_data->keyboard_ptr = keyboard;
-                    callback_data->log_func("⌨️  Keyboard stored for cleanup");
-                }
-            }
-        }
-    }
-
-    static void simple_seat_name(void *data, struct wl_seat *seat, const char *name) {
-        auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        if (callback_data->log_func) {
-            callback_data->log_func("Input seat name: " + std::string(name));
-        }
-    }
-
-    static const struct wl_seat_listener simple_seat_listener = {
-        simple_seat_capabilities,
-        simple_seat_name,
-    };
-
-    // Helper function to determine resize edge
-    static int get_resize_edge(int x, int y, int width, int height, int border_size) {
-        int edge = 0;
-
-        if (x < border_size)
-            edge |= 1; // left
-        if (x > width - border_size)
-            edge |= 2; // right
-        if (y < border_size)
-            edge |= 4; // top
-        if (y > height - border_size)
-            edge |= 8; // bottom
-
-        return edge;
-    }
-
-    // Convert internal edge flags to XDG shell resize edges
-    static uint32_t edge_to_xdg_edge(int edge) {
-        // XDG_TOPLEVEL_RESIZE_EDGE constants
-        const uint32_t XDG_TOPLEVEL_RESIZE_EDGE_NONE = 0;
-        const uint32_t XDG_TOPLEVEL_RESIZE_EDGE_TOP = 1;
-        const uint32_t XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM = 2;
-        const uint32_t XDG_TOPLEVEL_RESIZE_EDGE_LEFT = 4;
-        const uint32_t XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT = 5;
-        const uint32_t XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT = 6;
-        const uint32_t XDG_TOPLEVEL_RESIZE_EDGE_RIGHT = 8;
-        const uint32_t XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT = 9;
-        const uint32_t XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT = 10;
-
-        switch (edge) {
-        case 1:
-            return XDG_TOPLEVEL_RESIZE_EDGE_LEFT; // left
-        case 2:
-            return XDG_TOPLEVEL_RESIZE_EDGE_RIGHT; // right
-        case 4:
-            return XDG_TOPLEVEL_RESIZE_EDGE_TOP; // top
-        case 8:
-            return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM; // bottom
-        case 5:
-            return XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT; // top-left
-        case 6:
-            return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT; // bottom-left
-        case 9:
-            return XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT; // top-right
-        case 10:
-            return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT; // bottom-right
-        default:
-            return XDG_TOPLEVEL_RESIZE_EDGE_NONE;
-        }
-    }
-
-    // Function to set cursor
-    static void set_cursor(void *data, struct wl_pointer *pointer, uint32_t serial) {
-        auto *callback_data = static_cast<WaylandCallbackData *>(data);
-
-        if (!callback_data->default_cursor || !callback_data->cursor_surface) {
-            if (callback_data->log_func) {
-                callback_data->log_func("Warning: No cursor available to set");
-            }
-            return;
-        }
-
-        struct wl_cursor_image *image = callback_data->default_cursor->images[0];
-        if (!image) {
-            if (callback_data->log_func) {
-                callback_data->log_func("Warning: No cursor image available");
-            }
-            return;
-        }
-
-        // Attach cursor image to cursor surface
-        wl_surface_attach(callback_data->cursor_surface, wl_cursor_image_get_buffer(image), 0, 0);
-        wl_surface_damage(callback_data->cursor_surface, 0, 0, image->width, image->height);
-        wl_surface_commit(callback_data->cursor_surface);
-
-        // Set the cursor
-        wl_pointer_set_cursor(pointer, serial, callback_data->cursor_surface, image->hotspot_x, image->hotspot_y);
-
-        if (callback_data->log_func) {
-            callback_data->log_func("✅ Cursor set successfully");
-        }
-    }
-
-    // Pointer callbacks for debugging
-    static void debug_pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface,
-                                    wl_fixed_t sx, wl_fixed_t sy) {
-        auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        callback_data->mouse_over = true;
-
-        // Store initial mouse position
-        callback_data->last_mouse_x = wl_fixed_to_int(sx);
-        callback_data->last_mouse_y = wl_fixed_to_int(sy);
-
-        if (callback_data->log_func) {
-            callback_data->log_func("🎯 DEBUG: pointer_enter callback called!");
-            callback_data->log_func("🖱️  Mouse ENTERED window");
-            if (callback_data->debug_mode) {
-                callback_data->log_func("[DEBUG] Mouse enter - ready for input capture");
-            }
-        }
-
-        // Set cursor to make it visible
-        set_cursor(data, pointer, serial);
-    }
-
-    static void debug_pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial,
-                                    struct wl_surface *surface) {
-        auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        callback_data->mouse_over = false;
-        if (callback_data->log_func) {
-            callback_data->log_func("🖱️  Mouse LEFT window");
-            if (callback_data->debug_mode) {
-                callback_data->log_func("[DEBUG] Mouse leave - input capture paused");
-            }
-        }
-    }
-
-    static void debug_pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time, wl_fixed_t sx,
-                                     wl_fixed_t sy) {
-        auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        
-        // Debug: Always log the first few motion events to see what's happening
-        static int motion_debug_count = 0;
-        if (motion_debug_count < 10) {
-            motion_debug_count++;
-            if (callback_data->log_func) {
-                callback_data->log_func("[DEBUG] Motion event " + std::to_string(motion_debug_count) + 
-                                      ", debug_mode=" + std::string(callback_data->debug_mode ? "true" : "false") +
-                                      ", mouse_over=" + std::string(callback_data->mouse_over ? "true" : "false"));
-            }
-        }
-        
-        if (!callback_data->mouse_over)
-            return;
-
-        int x = wl_fixed_to_int(sx);
-        int y = wl_fixed_to_int(sy);
-
-        // Forward mouse motion to Input/Serial modules BEFORE updating position
-        if (callback_data->input_ptr && callback_data->serial_ptr && 
-            *callback_data->input_ptr && *callback_data->serial_ptr) {
-            
-            auto input = *callback_data->input_ptr;
-            auto serial = *callback_data->serial_ptr;
-            
-            // Check if input forwarding is enabled and serial is connected
-            if (input->isForwardingEnabled() && serial->isConnected()) {
-                // Calculate relative movement from last position
-                int delta_x = x - callback_data->last_mouse_x;
-                int delta_y = y - callback_data->last_mouse_y;
-                
-                // Only forward if there's actual movement (avoid spam)
-                if (delta_x != 0 || delta_y != 0) {
-                    // Forward to serial using relative movement
-                    bool success = serial->sendMouseMove(delta_x, delta_y, false);
-                    
-                    if (callback_data->log_func) {
-                        std::string msg = "[INPUT] Mouse motion forwarded: (" + 
-                                        std::to_string(delta_x) + ", " + std::to_string(delta_y) + ")";
-                        if (!success) {
-                            msg += " [FAILED]";
-                        }
-                        callback_data->log_func(msg);
-                    }
-                }
-            }
-        }
-
-        // Update stored position AFTER forwarding
-        callback_data->last_mouse_x = x;
-        callback_data->last_mouse_y = y;
-
-        // Check if we're currently resizing
-        if (callback_data->is_resizing) {
-            // Handle ongoing resize - this would be where you'd send resize requests
-            // to the window manager, but for now we'll just log it
-            if (callback_data->log_func) {
-                std::string msg = "🔄 Resizing window at: (" + std::to_string(x) + ", " + std::to_string(y) + ")";
-                callback_data->log_func(msg);
-            }
-            return;
-        }
-
-        // Check if mouse is near window edges for resize cursor
-        if (callback_data->current_width && callback_data->current_height) {
-            int edge = get_resize_edge(x, y, *callback_data->current_width, *callback_data->current_height,
-                                       WaylandCallbackData::RESIZE_BORDER);
-
-            if (edge != callback_data->resize_edge) {
-                callback_data->resize_edge = edge;
-
-                // Log when entering/leaving resize areas
-                if (callback_data->log_func) {
-                    if (edge != 0) {
-                        std::string msg =
-                            "🎯 Mouse near window edge - resize available (edge=" + std::to_string(edge) + ")";
-                        callback_data->log_func(msg);
-                    } else {
-                        callback_data->log_func("🎯 Mouse in window center - normal cursor");
-                    }
-                }
-
-                // Here you would set different cursor shapes based on edge:
-                // edge == 1|2: horizontal resize cursor
-                // edge == 4|8: vertical resize cursor
-                // edge == 5|6|9|10: diagonal resize cursors
-            }
-        }
-
-        // Debug logging for mouse motion
-        if (callback_data->debug_mode && callback_data->log_func) {
-            static int log_counter = 0;
-            if ((log_counter++ % 5 == 0)) { // Log every 5th motion event in debug mode (was 10)
-                std::string msg = "[DEBUG] Mouse motion: (" + std::to_string(x) + ", " + std::to_string(y) + ")";
-                if (callback_data->resize_edge != 0) {
-                    msg += " [resize edge: " + std::to_string(callback_data->resize_edge) + "]";
-                }
-                callback_data->log_func(msg);
-            }
-        }
-    }
-
-    static void debug_pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t time,
-                                     uint32_t button, uint32_t state) {
-        auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        
-        // Debug: Always log button events
-        if (callback_data->log_func) {
-            callback_data->log_func("[DEBUG] Button event received, debug_mode=" + 
-                                  std::string(callback_data->debug_mode ? "true" : "false") +
-                                  ", mouse_over=" + std::string(callback_data->mouse_over ? "true" : "false"));
-        }
-        
-        if (!callback_data->mouse_over)
-            return;
-
-        const char *action = (state == WL_POINTER_BUTTON_STATE_PRESSED) ? "PRESSED" : "RELEASED";
-        const char *btn_name = "";
-        switch (button) {
-        case 0x110:
-            btn_name = "LEFT";
-            break;
-        case 0x111:
-            btn_name = "RIGHT";
-            break;
-        case 0x112:
-            btn_name = "MIDDLE";
-            break;
-        default:
-            btn_name = "UNKNOWN";
-            break;
-        }
-
-        // Handle resize operations with left mouse button
-        if (button == 0x110) { // Left mouse button
-            if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
-                // Check if we're clicking on a resize edge
-                if (callback_data->resize_edge != 0 && callback_data->xdg_toplevel && callback_data->seat) {
-                    callback_data->is_resizing = true;
-                    callback_data->resize_serial = serial; // Store the serial for this resize operation
-
-                    uint32_t xdg_edge = edge_to_xdg_edge(callback_data->resize_edge);
-
-                    if (callback_data->log_func) {
-                        callback_data->log_func(
-                            "🔄 Starting window resize operation (edge=" + std::to_string(callback_data->resize_edge) +
-                            ", xdg_edge=" + std::to_string(xdg_edge) + ")");
-                    }
-
-                    // Actually start the resize operation
-                    xdg_toplevel_resize(callback_data->xdg_toplevel, callback_data->seat, serial, xdg_edge);
-                }
-            } else if (state == WL_POINTER_BUTTON_STATE_RELEASED) {
-                // Stop resizing
-                if (callback_data->is_resizing) {
-                    callback_data->is_resizing = false;
-                    if (callback_data->log_func) {
-                        callback_data->log_func("🔄 Finished window resize operation");
-                    }
-                }
-            }
-        }
-
-        // Forward mouse button events to Input/Serial modules if available
-        // Only forward if not currently resizing the window
-        if (!callback_data->is_resizing && callback_data->input_ptr && callback_data->serial_ptr && 
-            *callback_data->input_ptr && *callback_data->serial_ptr) {
-            
-            auto input = *callback_data->input_ptr;
-            auto serial = *callback_data->serial_ptr;
-            
-            // Check if input forwarding is enabled and serial is connected
-            if (input->isForwardingEnabled() && serial->isConnected()) {
-                bool pressed = (state == WL_POINTER_BUTTON_STATE_PRESSED);
-                
-                // Convert Wayland button codes to standard button numbers
-                int button_num = 0;
-                switch (button) {
-                case 0x110: button_num = 1; break; // Left button
-                case 0x111: button_num = 2; break; // Right button  
-                case 0x112: button_num = 3; break; // Middle button
-                default: button_num = 0; break;    // Unknown button
-                }
-                
-                if (button_num > 0) {
-                    // Forward to serial
-                    bool success = serial->sendMouseButton(button_num, pressed, 
-                                                         callback_data->last_mouse_x, 
-                                                         callback_data->last_mouse_y, true);
-                    
-                    if (callback_data->log_func) {
-                        std::string msg = "[INPUT] Mouse button " + std::to_string(button_num) + 
-                                        (pressed ? " pressed" : " released") + " forwarded";
-                        if (!success) {
-                            msg += " [FAILED]";
-                        }
-                        callback_data->log_func(msg);
-                    }
-                }
-            }
-        }
-
-        // Debug logging for mouse buttons
-        if (callback_data->debug_mode && callback_data->log_func) {
-            std::string msg = "[DEBUG] Mouse " + std::string(btn_name) + " button " + action;
-            if (callback_data->resize_edge != 0) {
-                msg += " (at resize edge " + std::to_string(callback_data->resize_edge) + ")";
-            }
-            callback_data->log_func(msg);
-        }
-    }
-
-    static void debug_pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis,
-                                   wl_fixed_t value) {
-        auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        
-        if (!callback_data->mouse_over)
-            return;
-            
-        const char *axis_name = (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) ? "VERTICAL" : "HORIZONTAL";
-        double scroll_value = wl_fixed_to_double(value);
-        
-        // Forward mouse scroll to Input/Serial modules if available
-        if (callback_data->input_ptr && callback_data->serial_ptr && 
-            *callback_data->input_ptr && *callback_data->serial_ptr) {
-            
-            auto input = *callback_data->input_ptr;
-            auto serial = *callback_data->serial_ptr;
-            
-            // Check if input forwarding is enabled and serial is connected
-            if (input->isForwardingEnabled() && serial->isConnected()) {
-                // Only handle vertical scrolling for now
-                if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
-                    // Convert scroll value to discrete scroll steps
-                    int32_t scroll_steps = 0;
-                    if (scroll_value > 0) {
-                        scroll_steps = 1;  // Scroll down
-                    } else if (scroll_value < 0) {
-                        scroll_steps = -1; // Scroll up
-                    }
-                    
-                    if (scroll_steps != 0) {
-                        // Use the Input module's scroll injection method
-                        bool success = input->injectMouseScroll(0, scroll_steps);
-                        
-                        if (callback_data->log_func) {
-                            std::string msg = "[INPUT] Mouse scroll " + std::string(axis_name) + 
-                                            " (" + std::to_string(scroll_steps) + ") forwarded";
-                            if (!success) {
-                                msg += " [FAILED]";
-                            }
-                            callback_data->log_func(msg);
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Debug logging
-        if (callback_data->log_func) {
-            std::string msg = "🖱️  Mouse scroll " + std::string(axis_name) + ": " + std::to_string(scroll_value);
-            callback_data->log_func(msg);
-        }
-    }
-
-    static void debug_pointer_frame(void *data, struct wl_pointer *pointer) {
-        // Frame event - end of pointer event group
-    }
-
-    static void debug_pointer_axis_source(void *data, struct wl_pointer *pointer, uint32_t axis_source) {
-        // Axis source (wheel, finger, etc.)
-    }
-
-    static void debug_pointer_axis_stop(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis) {
-        // Axis scrolling stopped
-    }
-
-    static void debug_pointer_axis_discrete(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t discrete) {
-        // Discrete axis events (scroll wheel clicks)
-    }
-
-    static void debug_pointer_axis_value120(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t value120) {
-        // High-resolution scroll wheel events
-    }
-
-    static void debug_pointer_axis_relative_direction(void *data, struct wl_pointer *pointer, uint32_t axis,
-                                                      uint32_t direction) {
-        // Relative direction for axis events
-    }
-
-    const struct wl_pointer_listener debug_pointer_listener = {
-        debug_pointer_enter,
-        debug_pointer_leave,
-        debug_pointer_motion,
-        debug_pointer_button,
-        debug_pointer_axis,
-        debug_pointer_frame,
-        debug_pointer_axis_source,
-        debug_pointer_axis_stop,
-        debug_pointer_axis_discrete,
-        debug_pointer_axis_value120,
-        debug_pointer_axis_relative_direction,
-    };
-
-    // Keyboard callbacks for debugging
-    static void debug_keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t format, int32_t fd,
-                                      uint32_t size) {
-        close(fd); // Just close the keymap fd for now
-    }
-
-    static void debug_keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial,
-                                     struct wl_surface *surface, struct wl_array *keys) {
-        auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        callback_data->input_active = true;
-        if (callback_data->debug_mode && callback_data->log_func) {
-            callback_data->log_func("[DEBUG] Keyboard FOCUS gained - capturing input");
-        }
-    }
-
-    static void debug_keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t serial,
-                                     struct wl_surface *surface) {
-        auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        callback_data->input_active = false;
-        if (callback_data->debug_mode && callback_data->log_func) {
-            callback_data->log_func("[DEBUG] Keyboard FOCUS lost - input released");
-        }
-    }
-
-    static void debug_keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time,
-                                   uint32_t key, uint32_t state) {
-        auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        
-        // Debug: Always log keyboard events
-        if (callback_data->log_func) {
-            callback_data->log_func("[DEBUG] Keyboard event received! debug_mode=" + 
-                                  std::string(callback_data->debug_mode ? "true" : "false") +
-                                  ", input_active=" + std::string(callback_data->input_active ? "true" : "false"));
-            
-            const char *action = (state == WL_KEYBOARD_KEY_STATE_PRESSED) ? "PRESSED" : "RELEASED";
-            std::string msg = "[DEBUG] Key " + std::to_string(key) + " " + action;
-            if (!callback_data->input_active) {
-                msg += " [WARNING: no keyboard focus]";
-            }
-            callback_data->log_func(msg);
-        }
-        
-        // Forward keyboard events to Input/Serial modules if available
-        if (callback_data->input_active && callback_data->input_ptr && callback_data->serial_ptr && 
-            *callback_data->input_ptr && *callback_data->serial_ptr) {
-            
-            auto input = *callback_data->input_ptr;
-            auto serial = *callback_data->serial_ptr;
-            
-            // Check if input forwarding is enabled and serial is connected
-            if (input->isForwardingEnabled() && serial->isConnected()) {
-                // Linux keycodes need +8 to convert to USB HID codes (roughly)
-                // This is a simplified mapping - a full implementation would use a proper keymap
-                int hid_keycode = key + 8;
-                
-                // Convert Wayland modifiers to CH9329 format
-                int modifiers = 0;
-                if (callback_data->current_modifiers & 1) modifiers |= 0x02;  // Shift
-                if (callback_data->current_modifiers & 4) modifiers |= 0x01;  // Ctrl
-                if (callback_data->current_modifiers & 8) modifiers |= 0x04;  // Alt
-                if (callback_data->current_modifiers & 64) modifiers |= 0x08; // Meta/Super
-                
-                if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-                    bool success = serial->sendKeyPress(hid_keycode, modifiers);
-                    if (callback_data->log_func) {
-                        std::string msg = "[INPUT] Key press forwarded: " + std::to_string(hid_keycode);
-                        if (!success) {
-                            msg += " [FAILED]";
-                        }
-                        callback_data->log_func(msg);
-                    }
-                } else {
-                    bool success = serial->sendKeyRelease(hid_keycode, modifiers);
-                    if (callback_data->log_func) {
-                        std::string msg = "[INPUT] Key release forwarded: " + std::to_string(hid_keycode);
-                        if (!success) {
-                            msg += " [FAILED]";
-                        }
-                        callback_data->log_func(msg);
-                    }
-                }
-            }
-        }
-    }
-
-    static void debug_keyboard_modifiers(void *data, struct wl_keyboard *keyboard, uint32_t serial,
-                                         uint32_t mods_depressed, uint32_t mods_latched, uint32_t mods_locked,
-                                         uint32_t group) {
-        auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        
-        // Store current modifiers for use in key events
-        callback_data->current_modifiers = mods_depressed;
-        
-        if (callback_data->input_active && callback_data->log_func && (mods_depressed || mods_latched || mods_locked)) {
-            std::string msg = "⌨️  Modifiers: Ctrl=" + std::to_string((mods_depressed & 4) ? 1 : 0) +
-                              " Shift=" + std::to_string((mods_depressed & 1) ? 1 : 0) +
-                              " Alt=" + std::to_string((mods_depressed & 8) ? 1 : 0);
-            callback_data->log_func(msg);
-        }
-    }
-
-    static void debug_keyboard_repeat_info(void *data, struct wl_keyboard *keyboard, int32_t rate, int32_t delay) {
-        // Keyboard repeat info
-    }
-
-    const struct wl_keyboard_listener debug_keyboard_listener = {
-        debug_keyboard_keymap, debug_keyboard_enter,     debug_keyboard_leave,
-        debug_keyboard_key,    debug_keyboard_modifiers, debug_keyboard_repeat_info,
-    };
-
     GUI::GUI() : pImpl(std::make_unique<Impl>()) {}
 
     GUI::~GUI() { shutdown(); }
@@ -1002,6 +259,20 @@ namespace openterface {
         }
 
         pImpl->info.video_displayed = true;
+        
+        // Allocate render buffer before starting thread
+        if (pImpl->buffer_width > 0 && pImpl->buffer_height > 0) {
+            size_t buffer_size = pImpl->buffer_width * pImpl->buffer_height * 4;
+            pImpl->render_buffer = malloc(buffer_size);
+            if (!pImpl->render_buffer) {
+                pImpl->log("Failed to allocate render buffer");
+                return false;
+            }
+        }
+        
+        // Start render thread for non-blocking frame processing
+        pImpl->thread_manager.startRenderThread([this]() { pImpl->renderThreadFunction(); });
+        
         pImpl->log("Video display and capture started successfully");
         return true;
     }
@@ -1009,6 +280,16 @@ namespace openterface {
     void GUI::stopVideoDisplay() {
         if (pImpl->info.video_displayed) {
             pImpl->log("Stopping video display");
+            
+            // Stop render thread
+            pImpl->thread_manager.stopRenderThread();
+            
+            // Free render buffer
+            if (pImpl->render_buffer) {
+                free(pImpl->render_buffer);
+                pImpl->render_buffer = nullptr;
+            }
+            
             pImpl->info.video_displayed = false;
         }
     }
@@ -1080,195 +361,60 @@ namespace openterface {
     }
 
     int GUI::runEventLoop() {
-        pImpl->log("Starting Wayland event loop");
+        pImpl->log("Starting application main thread (4-thread architecture)");
 
-        // Prepare for polling
-        struct pollfd fds[1];
-        fds[0].fd = wl_display_get_fd(pImpl->display);
-        fds[0].events = POLLIN;
+        // Start all specialized threads
+        pImpl->thread_manager.startWaylandEventThread([this]() { pImpl->waylandEventThreadFunction(); });
+        pImpl->thread_manager.startInputThread([this]() { pImpl->inputThreadFunction(); });
+        // Render thread already started in startVideoDisplay()
+        // Serial thread already started via connectAsync()
 
+        pImpl->log("All threads started - application running");
+
+        // Simplified application main thread - just handle buffer swaps and exit condition
         auto last_frame_time = std::chrono::steady_clock::now();
         const auto frame_duration = std::chrono::milliseconds(16); // Target 60 FPS
 
-        // Wayland event loop
+        // Application control loop (much simpler than Wayland event loop)
         while (!pImpl->exit_requested && pImpl->display) {
-            // Process any already pending events first
-            wl_display_dispatch_pending(pImpl->display);
-
-            // Flush any pending requests to the compositor
-            if (wl_display_flush(pImpl->display) < 0 && errno != EAGAIN) {
-                pImpl->log("Error flushing display: " + std::string(strerror(errno)));
-                break;
-            }
-
-            // Poll with a short timeout to stay responsive
-            int ret = poll(fds, 1, 5); // 5ms timeout for responsiveness
-
-            if (ret > 0) {
-                // Events are available, dispatch them directly
-                if (wl_display_dispatch(pImpl->display) == -1) {
-                    pImpl->log("Error dispatching Wayland events");
-                    break;
-                }
-            } else if (ret == 0) {
-                // Timeout - continue loop to stay responsive
-            } else {
-                // Error in poll
-                pImpl->log("Error in poll: " + std::string(strerror(errno)));
-                break;
-            }
-
-            // Handle resize in a separate thread if needed - don't block event loop
-            if (pImpl->needs_resize && pImpl->surface) {
-                static auto last_resize_attempt = std::chrono::steady_clock::now();
-                auto now = std::chrono::steady_clock::now();
-
-                // Only attempt resize every 16ms to avoid blocking too often
-                if (now - last_resize_attempt > std::chrono::milliseconds(16)) {
-                    std::unique_lock<std::mutex> lock(pImpl->resize_mutex, std::try_to_lock);
-                    if (lock.owns_lock() && pImpl->needs_resize && !pImpl->resize_in_progress.load()) {
-                        pImpl->resize_in_progress = true;
-
-                        // Quick dimension validation only
-                        if (pImpl->info.window_width > 0 && pImpl->info.window_height > 0 &&
-                            pImpl->info.window_width <= 4096 && pImpl->info.window_height <= 4096) {
-
-                            // Defer heavy buffer operations - just mark for later
-                            // This keeps the event loop responsive for ping/pong
-                            pImpl->needs_resize = false;
-                        }
-
-                        pImpl->resize_in_progress = false;
-                    }
-                    last_resize_attempt = now;
-                }
-            }
-
-            // Regular frame updates - update buffer content with new video frames
-            static auto last_commit_time = std::chrono::steady_clock::now();
             auto now = std::chrono::steady_clock::now();
 
-            if (now - last_commit_time > std::chrono::milliseconds(16)) {
+            // Simplified application thread - just handle buffer swaps
+            if (now - last_frame_time > frame_duration) {
                 if (pImpl->surface && pImpl->buffer && pImpl->shm_data) {
-                    // Only process valid RGB frames to prevent segfault
-                    {
-                        std::lock_guard<std::mutex> lock(pImpl->frame_mutex);
-                        pImpl->log("DEBUG CHECK: has_new_frame=" + std::to_string(pImpl->has_new_frame) + 
-                                   " frame_is_rgb=" + std::to_string(pImpl->frame_is_rgb.load()) + 
-                                   " frame_size=" + std::to_string(pImpl->current_frame.size()) + 
-                                   " dims=" + std::to_string(pImpl->frame_width) + "x" + std::to_string(pImpl->frame_height));
-                        
-                        if (pImpl->has_new_frame && pImpl->frame_is_rgb && !pImpl->current_frame.empty() && 
-                            pImpl->frame_width > 0 && pImpl->frame_height > 0) {
+                    // Lightweight frame update - just swap buffers if render thread completed processing
+                    if (pImpl->thread_manager.buffer_swap_ready.load()) {
+                        // Quick buffer swap - no heavy processing in main thread
+                        if (pImpl->render_buffer && pImpl->shm_data && 
+                            pImpl->buffer_width > 0 && pImpl->buffer_height > 0) {
                             
-                            // Validate RGB data size
-                            size_t expected_rgb_size = (size_t)(pImpl->frame_width * pImpl->frame_height * 3);
-                            if (pImpl->current_frame.size() == expected_rgb_size) {
-                                
-                                uint32_t *pixels = static_cast<uint32_t *>(pImpl->shm_data);
-                                const uint8_t* rgb_data = pImpl->current_frame.data();
-                                
-                                static int render_count = 0;
-                                if (++render_count % 30 == 1) {
-                                    pImpl->log("RENDERING: RGB video frame #" + std::to_string(render_count) + 
-                                               " (" + std::to_string(pImpl->frame_width) + "x" + std::to_string(pImpl->frame_height) + ")");
-                                }
-                                
-                                // Calculate scaling to fit video into buffer while maintaining aspect ratio
-                                float scale_x = (float)pImpl->buffer_width / (float)pImpl->frame_width;
-                                float scale_y = (float)pImpl->buffer_height / (float)pImpl->frame_height;
-                                float scale = std::min(scale_x, scale_y);
-                                
-                                int scaled_width = (int)((float)pImpl->frame_width * scale);
-                                int scaled_height = (int)((float)pImpl->frame_height * scale);
-                                int offset_x = (pImpl->buffer_width - scaled_width) / 2;
-                                int offset_y = (pImpl->buffer_height - scaled_height) / 2;
-                                
-                                // Clear the entire allocated buffer to black before drawing video
-                                // Use actual buffer dimensions to avoid memset overflow
-                                if (pImpl->buffer_width > 0 && pImpl->buffer_height > 0) {
-                                    size_t buffer_size = pImpl->buffer_width * pImpl->buffer_height * 4;
-                                    memset(pixels, 0, buffer_size);
-                                } else {
-                                    pImpl->log("Warning: Invalid buffer dimensions for memset");
-                                }
-                                
-                                // Calculate safe copy dimensions using actual buffer dimensions
-                                int copy_width = std::min(pImpl->frame_width, pImpl->buffer_width);
-                                int copy_height = std::min(pImpl->frame_height, pImpl->buffer_height);
-                                
-                                // Apply proper scaling using the calculated dimensions
-                                if (pImpl->frame_width > 0 && pImpl->frame_height > 0 && 
-                                    scaled_width > 0 && scaled_height > 0) {
-                                    
-                                    // Use scaled dimensions if they fit in the buffer
-                                    if (scaled_width <= pImpl->buffer_width && 
-                                        scaled_height <= pImpl->buffer_height) {
-                                        copy_width = scaled_width;
-                                        copy_height = scaled_height;
-                                    }
-                                    
-                                    // Center the video in the window
-                                    for (int y = 0; y < copy_height; y++) {
-                                        for (int x = 0; x < copy_width; x++) {
-                                            int dst_x = x + offset_x;
-                                            int dst_y = y + offset_y;
-                                            
-                                            // Bounds check for destination using buffer dimensions
-                                            if (dst_x >= 0 && dst_x < pImpl->buffer_width &&
-                                                dst_y >= 0 && dst_y < pImpl->buffer_height) {
-                                                
-                                                // Map scaled coordinates back to source frame
-                                                int src_x = (x * pImpl->frame_width) / copy_width;
-                                                int src_y = (y * pImpl->frame_height) / copy_height;
-                                                
-                                                // Bounds check for source
-                                                if (src_x < pImpl->frame_width && src_y < pImpl->frame_height) {
-                                                    int dst_idx = dst_y * pImpl->buffer_width + dst_x;
-                                                    int src_idx = (src_y * pImpl->frame_width + src_x) * 3;
-                                                    
-                                                    uint8_t red = rgb_data[src_idx];
-                                                    uint8_t green = rgb_data[src_idx + 1];
-                                                    uint8_t blue = rgb_data[src_idx + 2];
-                                                    
-                                                    pixels[dst_idx] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    // Fallback: direct copy without scaling
-                                    for (int y = 0; y < copy_height; y++) {
-                                        for (int x = 0; x < copy_width; x++) {
-                                            int dst_idx = y * pImpl->buffer_width + x;
-                                            int src_idx = (y * pImpl->frame_width + x) * 3;
-                                            
-                                            uint8_t red = rgb_data[src_idx];
-                                            uint8_t green = rgb_data[src_idx + 1];
-                                            uint8_t blue = rgb_data[src_idx + 2];
-                                            
-                                            pixels[dst_idx] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
-                                        }
-                                    }
-                                }
+                            size_t buffer_size = pImpl->buffer_width * pImpl->buffer_height * 4;
+                            
+                            // Fast memory copy from render buffer to display buffer
+                            memcpy(pImpl->shm_data, pImpl->render_buffer, buffer_size);
+                            
+                            static int swap_count = 0;
+                            if (++swap_count % 30 == 1) {
+                                pImpl->log("Buffer swap #" + std::to_string(swap_count) + " (render thread -> display)");
                             }
                             
-                            pImpl->has_new_frame = false;
-                            pImpl->frame_is_rgb = false;
+                            // Leave buffer_swap_ready = true so Wayland thread can commit the surface
                         }
                     }
-                    
-                    // Force Wayland to notice our changes
-                    wl_surface_attach(pImpl->surface, pImpl->buffer, 0, 0);
-                    wl_surface_damage(pImpl->surface, 0, 0, pImpl->info.window_width, pImpl->info.window_height);
-                    wl_surface_commit(pImpl->surface);
-                    wl_display_flush(pImpl->display);
                 }
-                last_commit_time = now;
+                last_frame_time = now;
             }
+            
+            // Short sleep to avoid busy waiting while keeping responsive
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
-        pImpl->log("GUI event loop exited");
+        // Stop all threads before exiting
+        pImpl->thread_manager.stopWaylandEventThread();
+        pImpl->thread_manager.stopInputThread();
+        // Render thread will be stopped in stopVideoDisplay()
+        
+        pImpl->log("Application main thread exited - all threads stopped");
         return 0;
     }
 
@@ -1692,89 +838,17 @@ namespace openterface {
         {
             std::lock_guard<std::mutex> lock(frame_mutex);
 
-            if (has_new_frame && !current_frame.empty() && frame_width > 0 && frame_height > 0) {
-                log("Rendering decoded video frame: " + std::to_string(frame_width) + "x" +
-                    std::to_string(frame_height) + " (" + std::to_string(current_frame.size()) + " bytes RGB)");
+            if (has_new_frame && current_frame.is_rgb && !current_frame.data.empty() && 
+                current_frame.width > 0 && current_frame.height > 0) {
+                log("Rendering decoded video frame: " + std::to_string(current_frame.width) + "x" +
+                    std::to_string(current_frame.height) + " (" + std::to_string(current_frame.data.size()) + " bytes RGB)");
 
-                // Check if current_frame contains RGB data (should be width * height * 3 bytes)
-                bool is_rgb_data = (current_frame.size() == frame_width * frame_height * 3);
-                
-                if (is_rgb_data) {
-                    // Clear buffer to black before drawing video (use actual allocated size)
-                    memset(pixels, 0, size);
-                    
-                    // Calculate scaling to fit video into window while maintaining aspect ratio
-                    float scale_x = (float)width / (float)frame_width;
-                    float scale_y = (float)height / (float)frame_height;
-                    float scale = std::min(scale_x, scale_y);
-                    
-                    int scaled_width = (int)((float)frame_width * scale);
-                    int scaled_height = (int)((float)frame_height * scale);
-                    int offset_x = (width - scaled_width) / 2;
-                    int offset_y = (height - scaled_height) / 2;
-                    
-                    // Render actual decoded RGB video data with proper scaling
-                    const uint8_t* rgb_data = current_frame.data();
-                    
-                    for (int y = 0; y < scaled_height; y++) {
-                        for (int x = 0; x < scaled_width; x++) {
-                            int dst_x = x + offset_x;
-                            int dst_y = y + offset_y;
-                            
-                            // Bounds check for destination
-                            if (dst_x >= 0 && dst_x < width && dst_y >= 0 && dst_y < height) {
-                                // Map scaled coordinates back to source frame
-                                int src_x = (x * frame_width) / scaled_width;
-                                int src_y = (y * frame_height) / scaled_height;
-                                
-                                // Bounds check for source
-                                if (src_x < frame_width && src_y < frame_height) {
-                                    int dst_idx = dst_y * width + dst_x;
-                                    int src_idx = (src_y * frame_width + src_x) * 3;
-                                    
-                                    if (src_idx >= 0 && src_idx + 2 < (int)current_frame.size() && 
-                                        dst_idx >= 0 && dst_idx < width * height) {
-                                        uint8_t red = rgb_data[src_idx];
-                                        uint8_t green = rgb_data[src_idx + 1];
-                                        uint8_t blue = rgb_data[src_idx + 2];
-                                        
-                                        // XRGB8888 format: 0xAARRGGBB
-                                        pixels[dst_idx] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    log("RGB video frame rendered successfully with scaling");
-                } else {
-                    // Fallback: show animated pattern for non-RGB data
-                    static uint8_t frame_counter = 0;
-                    frame_counter += 10;
-
-                    for (int y = 0; y < height; y++) {
-                        for (int x = 0; x < width; x++) {
-                            int dst_idx = y * width + x;
-
-                            uint8_t red = static_cast<uint8_t>((x + frame_counter) % 256);
-                            uint8_t green = static_cast<uint8_t>((y + frame_counter) % 256);
-                            uint8_t blue = frame_counter;
-
-                            pixels[dst_idx] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
-                        }
-                    }
-                    log("Fallback pattern rendered (non-RGB data)");
-                }
-
+                renderVideoToBuffer(pixels, width, height, current_frame);
+                log("RGB video frame rendered successfully with scaling");
                 has_new_frame = false; // Mark frame as processed
             } else {
-                // Fill with black pattern instead of gradient so video can be visible
-                for (int y = 0; y < height; y++) {
-                    for (int x = 0; x < width; x++) {
-                        int idx = y * width + x;
-                        // Use black background so we can see video updates
-                        pixels[idx] = 0xFF000000; // Black with full alpha
-                    }
-                }
+                // Fill with black background
+                fillBufferWithBlack(pixels, width, height);
                 log("No video frame available, using black background");
             }
         }
@@ -1835,10 +909,10 @@ namespace openterface {
 
         // ALWAYS clear previous frame data first to prevent stale data issues
         has_new_frame = false;  // Set this FIRST to stop any rendering immediately
-        frame_is_rgb = false;   // Clear RGB flag FIRST 
-        current_frame.clear();
-        frame_width = 0;
-        frame_height = 0;
+        current_frame.data.clear();
+        current_frame.width = 0;
+        current_frame.height = 0;
+        current_frame.is_rgb = false;
 
         // Store the frame data
         if (frame.data && frame.size > 0) {
@@ -1851,29 +925,22 @@ namespace openterface {
                     std::to_string(frame.height) + " size=" + std::to_string(frame.size) + " bytes");
             }
 
-            // Try to decode MJPEG frame
-            DecodedFrame decoded_frame;
-            if (jpeg_decoder.decode(frame.data, frame.size, decoded_frame)) {
-                // Successfully decoded MJPEG to RGB
-                current_frame.resize(decoded_frame.rgb_data.size());
-                memcpy(current_frame.data(), decoded_frame.rgb_data.data(), decoded_frame.rgb_data.size());
-                frame_width = decoded_frame.width;
-                frame_height = decoded_frame.height;
+            // Process the frame using VideoProcessor
+            if (video_processor.processFrame(frame, current_frame)) {
                 has_new_frame = true;
-                frame_is_rgb = true;
+                
+                // Signal rendering thread to process the frame
+                thread_manager.frame_ready_for_render = true;
+                thread_manager.notifyRender();
                 
                 if (frame_count % 30 == 1) {
-                    log("MJPEG frame decoded successfully: " + std::to_string(decoded_frame.width) + "x" + 
-                        std::to_string(decoded_frame.height) + " RGB");
+                    log("MJPEG frame decoded successfully: " + std::to_string(current_frame.width) + "x" + 
+                        std::to_string(current_frame.height) + " RGB");
                 }
             } else {
-                // MJPEG decode failed - clear all frame data to prevent processing
-                log("MJPEG decode failed: " + jpeg_decoder.getLastError() + ", clearing frame data");
-                current_frame.clear();
-                frame_width = 0;
-                frame_height = 0; 
+                // MJPEG decode failed
+                log("MJPEG decode failed: " + video_processor.getLastError());
                 has_new_frame = false;
-                frame_is_rgb = false;
             }
 
             // Don't force buffer recreation - let event loop handle updates
@@ -1881,38 +948,149 @@ namespace openterface {
         }
     }
 
-    // Wayland registry callbacks
-    static void registry_global(void *data, struct wl_registry *registry, uint32_t id, const char *interface,
-                                uint32_t version) {
-        auto *callback_data = static_cast<WaylandCallbackData *>(data);
+    void GUI::Impl::renderThreadFunction() {
+        log("Rendering thread started");
+        
+        while (thread_manager.render_thread_running.load()) {
+            std::unique_lock<std::mutex> lock(thread_manager.render_mutex);
+            
+            // Wait for frame to be ready or exit signal
+            thread_manager.render_cv.wait(lock, [this] { 
+                return thread_manager.frame_ready_for_render.load() || !thread_manager.render_thread_running.load(); 
+            });
+            
+            if (!thread_manager.render_thread_running.load()) break;
+            if (!thread_manager.frame_ready_for_render.load()) continue;
+            
+            // Process the frame in this background thread
+            {
+                std::lock_guard<std::mutex> frame_lock(frame_mutex);
+                
+                if (has_new_frame && current_frame.is_rgb && !current_frame.data.empty() && 
+                    current_frame.width > 0 && current_frame.height > 0 && shm_data && render_buffer) {
+                    
+                    // Render video to the render buffer
+                    renderVideoToBuffer(render_buffer, buffer_width, buffer_height, current_frame);
+                    
+                    // Signal that buffer is ready for swap
+                    thread_manager.buffer_swap_ready = true;
+                    has_new_frame = false;
+                }
+            }
+            
+            thread_manager.frame_ready_for_render = false;
+        }
+        
+        log("Rendering thread stopped");
+    }
 
-        if (strcmp(interface, wl_compositor_interface.name) == 0) {
-            callback_data->compositor =
-                static_cast<wl_compositor *>(wl_registry_bind(registry, id, &wl_compositor_interface, 1));
-            if (callback_data->log_func)
-                callback_data->log_func("Found compositor");
-        } else if (strcmp(interface, wl_shell_interface.name) == 0) {
-            callback_data->shell = static_cast<wl_shell *>(wl_registry_bind(registry, id, &wl_shell_interface, 1));
-            if (callback_data->log_func)
-                callback_data->log_func("Found shell (deprecated)");
-        } else if (strcmp(interface, wl_shm_interface.name) == 0) {
-            callback_data->shm = static_cast<wl_shm *>(wl_registry_bind(registry, id, &wl_shm_interface, 1));
-            if (callback_data->log_func)
-                callback_data->log_func("Found shared memory");
-        } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
-            callback_data->xdg_wm_base =
-                static_cast<xdg_wm_base *>(wl_registry_bind(registry, id, &xdg_wm_base_interface, 1));
-            if (callback_data->log_func)
-                callback_data->log_func("Found xdg_wm_base");
-        } else if (strcmp(interface, wl_seat_interface.name) == 0) {
-            callback_data->seat = static_cast<wl_seat *>(wl_registry_bind(registry, id, &wl_seat_interface, 1));
-            if (callback_data->log_func)
-                callback_data->log_func("Found seat");
+
+    void GUI::Impl::waylandEventThreadFunction() {
+        // CRITICAL: This thread must handle ALL Wayland events but NOT block on serial I/O
+        // The problem is that input callbacks do blocking serial writes
+        
+        while (thread_manager.wayland_thread_running.load() && display) {
+            
+            // Handle all Wayland events (ping-pong, input, etc)
+            wl_display_dispatch_pending(display);
+            wl_display_flush(display);
+            
+            // Check if we need to commit surface updates
+            if (thread_manager.buffer_swap_ready.load() && surface && buffer) {
+                wl_surface_attach(surface, buffer, 0, 0);
+                wl_surface_damage(surface, 0, 0, buffer_width, buffer_height);
+                wl_surface_commit(surface);
+                thread_manager.buffer_swap_ready = false;
+            }
+            
+            // Poll for new events
+            struct pollfd pfd;
+            pfd.fd = wl_display_get_fd(display);
+            pfd.events = POLLIN;
+            
+            if (poll(&pfd, 1, 0) > 0) {
+                wl_display_dispatch(display);
+            }
+            
+            // Minimal sleep
+            struct timespec ts = {0, 10000}; // 10 microseconds
+            nanosleep(&ts, nullptr);
         }
     }
 
-    static void registry_global_remove(void *data, struct wl_registry *registry, uint32_t id) {
-        // Handle global removal if needed
+    void GUI::Impl::processSurfaceUpdates() {
+        // Process any pending surface update requests
+        SurfaceCommitRequest request;
+        while (surface_update_queue.pop(request)) {
+            switch (request.type) {
+                case SurfaceCommitRequest::ATTACH_BUFFER:
+                    if (surface && buffer) {
+                        wl_surface_attach(surface, buffer, 0, 0);
+                    }
+                    break;
+                case SurfaceCommitRequest::DAMAGE:
+                    if (surface) {
+                        wl_surface_damage(surface, request.x, request.y, request.width, request.height);
+                    }
+                    break;
+                case SurfaceCommitRequest::COMMIT:
+                    if (surface) {
+                        wl_surface_commit(surface);
+                    }
+                    break;
+            }
+        }
     }
+
+
+    void GUI::Impl::inputThreadFunction() {
+        log("Input processing thread started");
+        
+        // Track last processed mouse position
+        int last_processed_x = 0;
+        int last_processed_y = 0;
+        
+        while (thread_manager.input_thread_running.load()) {
+            
+            // Poll current mouse position from callback data (non-blocking)
+            if (callback_data.mouse_over && callback_data.input_active) {
+                int current_x = callback_data.last_mouse_x;
+                int current_y = callback_data.last_mouse_y;
+                
+                // Check if position changed
+                if (current_x != last_processed_x || current_y != last_processed_y) {
+                    int delta_x = current_x - last_processed_x;
+                    int delta_y = current_y - last_processed_y;
+                    
+                    // Forward mouse movement (this can block but it's in separate thread)
+                    if (serial && serial->isConnected() && (delta_x != 0 || delta_y != 0)) {
+                        serial->sendMouseMove(delta_x, delta_y, false);
+                        if (debug_input) {
+                            log("[INPUT] Mouse motion forwarded: (" + 
+                                std::to_string(delta_x) + ", " + std::to_string(delta_y) + ")");
+                        }
+                    }
+                    
+                    last_processed_x = current_x;
+                    last_processed_y = current_y;
+                }
+            }
+            
+            // Sleep to avoid busy waiting
+            std::this_thread::sleep_for(std::chrono::milliseconds(5)); // 200Hz polling
+        }
+        
+        log("Input processing thread stopped");
+    }
+
+    void GUI::Impl::queueInputEvent(const InputEvent& event) {
+        {
+            std::lock_guard<std::mutex> lock(input_queue_mutex);
+            input_queue.push(event);
+        }
+        thread_manager.notifyInput();
+    }
+
+    // Wayland registry callbacks
 
 } // namespace openterface

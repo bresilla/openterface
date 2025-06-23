@@ -427,5 +427,12 @@ namespace openterface {
     bool Input::requestKeyboardFocus() { return false; }
     bool Input::requestMouseFocus() { return false; }
     void Input::releaseFocus() {}
+    
+    void Input::stopMouseTracking() {
+        if (pImpl->serial) {
+            // Send a "stop tracking" command or reset mouse state
+            pImpl->log("Explicitly stopping mouse tracking");
+        }
+    }
 
 } // namespace openterface

@@ -17,10 +17,16 @@ namespace openterface {
     struct Serial::Impl {
         std::string port_name;
         int baudrate = 115200;
-        bool connected = false;
-        bool target_connected = false;
+        std::atomic<bool> connected{false};
+        std::atomic<bool> target_connected{false};
+        std::atomic<bool> connecting{false};
         int fd = -1;  // File descriptor for serial port
-
+        
+        // Threading support
+        std::thread connection_thread;
+        std::mutex connection_mutex;
+        ConnectionCallback connection_callback;
+        
         void log(const std::string &msg) { std::cout << "[SERIAL] " << msg << std::endl; }
         
         // Calculate checksum for CH9329 commands (matches Qt implementation)
@@ -74,11 +80,129 @@ namespace openterface {
             return true;
     #endif
         }
+        
+        // Helper method to open serial port at specific baud rate
+        bool openSerialPort(int baud_rate) {
+    #ifdef __linux__
+            // Open serial port
+            fd = open(port_name.c_str(), O_RDWR | O_NOCTTY | O_SYNC);
+            if (fd < 0) {
+                log("Failed to open serial port " + port_name + ": " + std::string(strerror(errno)));
+                return false;
+            }
+            
+            // Configure serial port
+            struct termios tty;
+            if (tcgetattr(fd, &tty) != 0) {
+                log("Error getting terminal attributes: " + std::string(strerror(errno)));
+                close(fd);
+                fd = -1;
+                return false;
+            }
+            
+            // Set baud rate
+            speed_t speed;
+            switch (baud_rate) {
+                case 9600: speed = B9600; break;
+                case 115200: speed = B115200; break;
+                default:
+                    log("Unsupported baud rate: " + std::to_string(baud_rate));
+                    close(fd);
+                    fd = -1;
+                    return false;
+            }
+            
+            cfsetospeed(&tty, speed);
+            cfsetispeed(&tty, speed);
+            
+            // Configure 8N1
+            tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
+            tty.c_iflag &= ~IGNBRK;
+            tty.c_lflag = 0;
+            tty.c_oflag = 0;
+            tty.c_cc[VMIN] = 0;
+            tty.c_cc[VTIME] = 5;
+            tty.c_iflag &= ~(IXON | IXOFF | IXANY);
+            tty.c_cflag |= (CLOCAL | CREAD);
+            tty.c_cflag &= ~(PARENB | PARODD);
+            tty.c_cflag &= ~CSTOPB;
+            tty.c_cflag &= ~CRTSCTS;
+            
+            if (tcsetattr(fd, TCSANOW, &tty) != 0) {
+                log("Error setting terminal attributes: " + std::string(strerror(errno)));
+                close(fd);
+                fd = -1;
+                return false;
+            }
+            
+            this->baudrate = baud_rate;
+            log("Serial port opened at " + std::to_string(baud_rate) + " baud");
+            return true;
+    #else
+            log("Serial port opening not supported on this platform");
+            return false;
+    #endif
+        }
+        
+        // Helper method to reset and reconfigure CH9329 chip  
+        bool resetChip() {
+            log("Resetting CH9329 chip...");
+            
+            // Send reset command
+            std::vector<uint8_t> reset_cmd = {0x57, 0xAB, 0x00, 0x0F, 0x00};
+            if (!sendCommandWithChecksum(reset_cmd)) {
+                log("Failed to send reset command");
+                return false;
+            }
+            
+            usleep(100000); // 100ms delay for reset
+            
+            // Send configuration command to set proper mode (0x82) and 115200 baud
+            std::vector<uint8_t> config_cmd = {
+                0x57, 0xAB, 0x00, 0x09, 0x32, // Header
+                0x82, 0x80, 0x00, 0x00,       // Mode and address
+                0x00, 0x01, 0xC2, 0x00,       // Baud rate 115200 (little endian)
+                0x08, 0x00, 0x00, 0x03,       // Reserved and intervals
+                0x86, 0x1A, 0x29, 0xE1,       // VID/PID
+                0x00, 0x00, 0x00, 0x01,       // Timeouts 
+                0x00, 0x0D, 0x00, 0x00,       // Enter key and filters
+                0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 
+                0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00
+            };
+            
+            if (!sendCommandWithChecksum(config_cmd)) {
+                log("Failed to send configuration command");
+                return false; 
+            }
+            
+            usleep(50000); // 50ms delay
+            
+            // Send final reset to apply configuration
+            if (!sendCommandWithChecksum(reset_cmd)) {
+                log("Failed to send final reset command");
+                return false;
+            }
+            
+            usleep(200000); // 200ms delay for chip to restart
+            log("CH9329 chip reset and reconfigured successfully");
+            return true;
+        }
     };
 
     Serial::Serial() : pImpl(std::make_unique<Impl>()) {}
 
-    Serial::~Serial() = default;
+    Serial::~Serial() {
+        disconnect();
+        
+        // Clean up any running connection thread
+        if (pImpl->connection_thread.joinable()) {
+            pImpl->connection_thread.join();
+        }
+    }
 
     bool Serial::connect(const std::string &port, int baudrate) {
         pImpl->port_name = port;
@@ -100,6 +224,52 @@ namespace openterface {
         
         pImpl->log("Failed to connect at any baud rate");
         return false;
+    }
+    
+    void Serial::connectAsync(const std::string &port, int baudrate, ConnectionCallback callback) {
+        // Clean up any existing connection thread
+        if (pImpl->connection_thread.joinable()) {
+            pImpl->connection_thread.join();
+        }
+        
+        std::lock_guard<std::mutex> lock(pImpl->connection_mutex);
+        
+        // Don't start if already connected or connecting
+        if (pImpl->connected.load() || pImpl->connecting.load()) {
+            if (callback) {
+                callback(pImpl->connected.load(), pImpl->connected.load() ? "Already connected" : "Connection in progress");
+            }
+            return;
+        }
+        
+        pImpl->connection_callback = callback;
+        pImpl->connecting = true;
+        
+        // Start connection in background thread
+        pImpl->connection_thread = std::thread([this, port, baudrate]() {
+            bool success = false;
+            std::string message;
+            
+            try {
+                success = this->connect(port, baudrate);
+                message = success ? "Connected successfully" : "Connection failed";
+            } catch (const std::exception& e) {
+                message = std::string("Connection error: ") + e.what();
+            } catch (...) {
+                message = "Unknown connection error";
+            }
+            
+            pImpl->connecting = false;
+            
+            // Call callback on completion
+            if (pImpl->connection_callback) {
+                pImpl->connection_callback(success, message);
+            }
+        });
+    }
+    
+    bool Serial::isConnecting() const {
+        return pImpl->connecting.load();
     }
     
     bool Serial::connectAtBaudRate(const std::string &port, int baudrate) {
@@ -159,13 +329,13 @@ namespace openterface {
 
         pImpl->connected = true;
         
-        // Send CH9329 initialization commands
+        // Send CH9329 initialization commands - improved sequence matching QT implementation
         pImpl->log("Initializing CH9329 chip...");
         
         // Small delay to let port settle
         usleep(50000); // 50ms
         
-        // Send CMD_GET_PARA_CFG to check chip configuration (with checksum)
+        // Send CMD_GET_PARA_CFG to check chip configuration
         std::vector<uint8_t> get_para_cmd = {0x57, 0xAB, 0x00, 0x08, 0x00};
         if (!pImpl->sendCommandWithChecksum(get_para_cmd)) {
             pImpl->log("Failed to send parameter config command");
@@ -175,28 +345,68 @@ namespace openterface {
             return false;
         }
         
-        usleep(50000); // 50ms delay for chip to be ready
+        usleep(100000); // 100ms delay to allow response
         
-        // Send CMD_GET_INFO to check target connection (with checksum)
-        std::vector<uint8_t> get_info_cmd = {0x57, 0xAB, 0x00, 0x01, 0x00};
-        if (!pImpl->sendCommandWithChecksum(get_info_cmd)) {
-            pImpl->log("Failed to send info command");
+        // Read response to check configuration  
+        auto config_response = readData();
+        bool config_ok = false;
+        
+        if (!config_response.empty() && config_response.size() >= 6) {
+            pImpl->log("Got parameter config response (" + std::to_string(config_response.size()) + " bytes)");
+            
+            // Check if mode is correct (byte 5 should be 0x82)
+            if (config_response.size() > 5 && config_response[5] == 0x82) {
+                pImpl->log("CH9329 is in correct mode (0x82)");
+                config_ok = true;
+            } else {
+                pImpl->log("CH9329 mode incorrect (got 0x" + 
+                          std::to_string(config_response[5]) + "), attempting reset");
+                          
+                // Reset and reconfigure chip to proper mode
+                if (pImpl->resetChip()) {
+                    config_ok = true;
+                } else {
+                    pImpl->log("Failed to reset CH9329 chip");
+                    close(pImpl->fd);
+                    pImpl->fd = -1;
+                    pImpl->connected = false;
+                    return false;
+                }
+            }
+        } else {
+            pImpl->log("No response to parameter config command");
+            // Still try to continue - device might be in wrong baud rate
+            // Let the fallback logic in connect() handle this
             close(pImpl->fd);
             pImpl->fd = -1;
             pImpl->connected = false;
             return false;
         }
         
-        usleep(100000); // 100ms delay to allow response
+        if (!config_ok) {
+            pImpl->log("CH9329 configuration failed");
+            close(pImpl->fd);
+            pImpl->fd = -1;
+            pImpl->connected = false;
+            return false;
+        }
         
-        // Read response to check if target is connected
-        auto response = readData();
-        if (!response.empty()) {
-            pImpl->log("CH9329 responded to info command - chip is active");
-            pImpl->target_connected = true;
+        // Send CMD_GET_INFO to check target connection status
+        std::vector<uint8_t> get_info_cmd = {0x57, 0xAB, 0x00, 0x01, 0x00};
+        if (pImpl->sendCommandWithChecksum(get_info_cmd)) {
+            usleep(50000); // 50ms delay
+            auto info_response = readData();
+            if (!info_response.empty()) {
+                pImpl->log("CH9329 info command successful - device ready");
+                pImpl->target_connected = true;
+            } else {
+                pImpl->log("Warning: No response from CH9329 to info command");
+                pImpl->target_connected = false;
+            }
         } else {
-            pImpl->log("Warning: No response from CH9329 to info command");
-            pImpl->target_connected = false; // Still continue, but note the issue
+            pImpl->log("Failed to send info command");
+            // Don't fail here - device might still work
+            pImpl->target_connected = false;
         }
         
         pImpl->log("CH9329 initialized successfully");
@@ -309,8 +519,13 @@ namespace openterface {
             // Relative mouse prefix: 57 AB 00 05 05 01  
             cmd = {0x57, 0xAB, 0x00, 0x05, 0x05, 0x01};
             cmd.push_back(0x00); // mouse_event (no button for move)
-            cmd.push_back(static_cast<uint8_t>(x & 0xFF)); // dx
-            cmd.push_back(static_cast<uint8_t>(y & 0xFF)); // dy  
+            
+            // Handle signed 8-bit values for relative movement (matching QT implementation)
+            int8_t dx = static_cast<int8_t>(std::max(-127, std::min(127, x)));
+            int8_t dy = static_cast<int8_t>(std::max(-127, std::min(127, y)));
+            
+            cmd.push_back(static_cast<uint8_t>(dx)); // dx as signed byte
+            cmd.push_back(static_cast<uint8_t>(dy)); // dy as signed byte  
             cmd.push_back(0x00); // wheel (no wheel for move)
         }
 
