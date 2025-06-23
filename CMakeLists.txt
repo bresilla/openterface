@@ -40,6 +40,14 @@ pkg_check_modules(WAYLAND_CURSOR REQUIRED wayland-cursor)
 list(APPEND ext_deps ${WAYLAND_CLIENT_LIBRARIES})
 list(APPEND ext_deps ${WAYLAND_CURSOR_LIBRARIES})
 
+# Find EGL and OpenGL ES for GPU acceleration
+pkg_check_modules(WAYLAND_EGL REQUIRED wayland-egl)
+pkg_check_modules(EGL REQUIRED egl)
+pkg_check_modules(GLES2 REQUIRED glesv2)
+list(APPEND ext_deps ${WAYLAND_EGL_LIBRARIES})
+list(APPEND ext_deps ${EGL_LIBRARIES})
+list(APPEND ext_deps ${GLES2_LIBRARIES})
+
 # Find libjpeg for MJPEG decoding
 find_package(JPEG REQUIRED)
 list(APPEND ext_deps ${JPEG_LIBRARIES})
@@ -106,7 +114,7 @@ if(${project_name_upper}_BUILD_EXAMPLES)
         target_compile_options(${exec_name} PRIVATE ${params})
         target_sources(${exec_name} PRIVATE "${lib_file}")
       endforeach()
-    target_include_directories(${exec_name} PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS} ${JPEG_INCLUDE_DIRS})
+    target_include_directories(${exec_name} PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS} ${WAYLAND_EGL_INCLUDE_DIRS} ${EGL_INCLUDE_DIRS} ${GLES2_INCLUDE_DIRS} ${JPEG_INCLUDE_DIRS})
     target_link_libraries(${exec_name} ${ext_deps})
     install(TARGETS ${exec_name} DESTINATION bin)
     list(APPEND exec_names ${exec_name})

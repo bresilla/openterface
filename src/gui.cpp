@@ -3,6 +3,7 @@
 #include "openterface/gui_input.hpp"
 #include "openterface/gui_video.hpp"
 #include "openterface/gui_threading.hpp"
+#include "openterface/gpu_video_renderer.hpp"
 #include "openterface/input.hpp"
 #include "openterface/serial.hpp"
 #include "openterface/video.hpp"
@@ -111,6 +112,10 @@ namespace openterface {
 
         // Video processor for frame decoding
         VideoProcessor video_processor;
+        
+        // GPU-accelerated video renderer (like QT)
+        GPUVideoRenderer gpu_renderer;
+        bool use_gpu_acceleration = true;
         
         // Thread-safe surface update queue
         SurfaceUpdateQueue surface_update_queue;
@@ -539,6 +544,12 @@ namespace openterface {
     }
 
     void GUI::Impl::cleanupWayland() {
+        // Cleanup GPU renderer first
+        if (use_gpu_acceleration) {
+            gpu_renderer.cleanup();
+            log("GPU renderer cleaned up");
+        }
+        
         // Only cleanup if we have something to clean up
         if (!display) {
             return; // Nothing to clean up
@@ -719,16 +730,32 @@ namespace openterface {
             wl_display_flush(display);
             wl_display_dispatch_pending(display);
 
-            // Create buffer with content
-            if (!createBuffer(info.window_width, info.window_height)) {
-                log("Failed to create buffer");
-                return false;
+            // Initialize GPU acceleration if available
+            if (use_gpu_acceleration) {
+                log("Initializing GPU-accelerated video rendering...");
+                if (gpu_renderer.initialize(display, surface, info.window_width, info.window_height)) {
+                    log("GPU acceleration enabled (like QT)");
+                    // Skip CPU buffer creation when using GPU
+                } else {
+                    log("GPU acceleration failed, falling back to CPU rendering: " + gpu_renderer.getLastError());
+                    use_gpu_acceleration = false;
+                }
             }
 
-            // Attach buffer and commit
-            wl_surface_attach(surface, buffer, 0, 0);
-            wl_surface_damage(surface, 0, 0, info.window_width, info.window_height);
-            wl_surface_commit(surface);
+            // Create CPU buffer only if not using GPU acceleration
+            if (!use_gpu_acceleration) {
+                if (!createBuffer(info.window_width, info.window_height)) {
+                    log("Failed to create buffer");
+                    return false;
+                }
+            }
+
+            // Attach buffer and commit (only for CPU rendering)
+            if (!use_gpu_acceleration && buffer) {
+                wl_surface_attach(surface, buffer, 0, 0);
+                wl_surface_damage(surface, 0, 0, info.window_width, info.window_height);
+                wl_surface_commit(surface);
+            }
 
             // Set up input if seat is available
             if (seat) {
@@ -951,6 +978,18 @@ namespace openterface {
     void GUI::Impl::renderThreadFunction() {
         log("Rendering thread started (optimized for low latency)");
         
+        // Initialize GPU context in this thread if needed
+        bool gpu_initialized_in_thread = false;
+        if (use_gpu_acceleration && gpu_renderer.isInitialized()) {
+            if (gpu_renderer.initializeInCurrentThread()) {
+                log("GPU context initialized in render thread");
+                gpu_initialized_in_thread = true;
+            } else {
+                log("GPU context initialization failed in render thread: " + gpu_renderer.getLastError());
+                use_gpu_acceleration = false;
+            }
+        }
+        
         while (thread_manager.render_thread_running.load()) {
             std::unique_lock<std::mutex> lock(thread_manager.render_mutex);
             
@@ -968,14 +1007,24 @@ namespace openterface {
                 std::lock_guard<std::mutex> frame_lock(frame_mutex);
                 
                 if (has_new_frame && current_frame.is_rgb && !current_frame.data.empty() && 
-                    current_frame.width > 0 && current_frame.height > 0 && shm_data && render_buffer) {
+                    current_frame.width > 0 && current_frame.height > 0) {
                     
-                    // Render video to the render buffer (this is the expensive operation)
-                    renderVideoToBuffer(render_buffer, buffer_width, buffer_height, current_frame);
-                    
-                    // Signal that buffer is ready for swap IMMEDIATELY
-                    thread_manager.buffer_swap_ready = true;
-                    has_new_frame = false;
+                    if (use_gpu_acceleration && gpu_initialized_in_thread) {
+                        // GPU-accelerated rendering (like QT) - much faster!
+                        if (gpu_renderer.renderFrame(current_frame)) {
+                            // GPU rendering is complete, no need for buffer swap
+                            has_new_frame = false;
+                        } else {
+                            log("GPU rendering failed: " + gpu_renderer.getLastError());
+                        }
+                    } else if (shm_data && render_buffer) {
+                        // CPU fallback rendering
+                        renderVideoToBuffer(render_buffer, buffer_width, buffer_height, current_frame);
+                        
+                        // Signal that buffer is ready for swap IMMEDIATELY
+                        thread_manager.buffer_swap_ready = true;
+                        has_new_frame = false;
+                    }
                 }
             }
             
@@ -998,7 +1047,8 @@ namespace openterface {
             wl_display_flush(display);
             
             // PRIORITY: Check for video frame updates FREQUENTLY for smooth 30fps
-            if (thread_manager.buffer_swap_ready.load() && surface && buffer) {
+            // Only handle CPU buffer swaps (GPU renders directly to surface)
+            if (!use_gpu_acceleration && thread_manager.buffer_swap_ready.load() && surface && buffer) {
                 wl_surface_attach(surface, buffer, 0, 0);
                 wl_surface_damage(surface, 0, 0, buffer_width, buffer_height);
                 wl_surface_commit(surface);
