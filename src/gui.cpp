@@ -949,35 +949,37 @@ namespace openterface {
     }
 
     void GUI::Impl::renderThreadFunction() {
-        log("Rendering thread started");
+        log("Rendering thread started (optimized for low latency)");
         
         while (thread_manager.render_thread_running.load()) {
             std::unique_lock<std::mutex> lock(thread_manager.render_mutex);
             
-            // Wait for frame to be ready or exit signal
-            thread_manager.render_cv.wait(lock, [this] { 
+            // Use timeout to prevent blocking and check for frames regularly
+            auto timeout = std::chrono::milliseconds(1);  // 1ms timeout for responsive rendering
+            thread_manager.render_cv.wait_for(lock, timeout, [this] { 
                 return thread_manager.frame_ready_for_render.load() || !thread_manager.render_thread_running.load(); 
             });
             
             if (!thread_manager.render_thread_running.load()) break;
             if (!thread_manager.frame_ready_for_render.load()) continue;
             
-            // Process the frame in this background thread
+            // Process the frame in this background thread with minimal locking
             {
                 std::lock_guard<std::mutex> frame_lock(frame_mutex);
                 
                 if (has_new_frame && current_frame.is_rgb && !current_frame.data.empty() && 
                     current_frame.width > 0 && current_frame.height > 0 && shm_data && render_buffer) {
                     
-                    // Render video to the render buffer
+                    // Render video to the render buffer (this is the expensive operation)
                     renderVideoToBuffer(render_buffer, buffer_width, buffer_height, current_frame);
                     
-                    // Signal that buffer is ready for swap
+                    // Signal that buffer is ready for swap IMMEDIATELY
                     thread_manager.buffer_swap_ready = true;
                     has_new_frame = false;
                 }
             }
             
+            // Clear frame ready flag IMMEDIATELY after processing
             thread_manager.frame_ready_for_render = false;
         }
         

@@ -65,9 +65,14 @@ bool JpegDecoder::decode(const uint8_t* jpeg_data, size_t jpeg_size, DecodedFram
         return false;
     }
 
-    // Set decompression parameters for RGB output
+    // Set decompression parameters for RGB output with performance optimizations
     cinfo.out_color_space = JCS_RGB;
     cinfo.output_components = 3;
+    
+    // Performance optimizations (like ffplay)
+    cinfo.do_fancy_upsampling = FALSE;  // Disable fancy upsampling for speed
+    cinfo.do_block_smoothing = FALSE;   // Disable block smoothing for speed
+    cinfo.dct_method = JDCT_IFAST;      // Use fastest DCT method
 
     // Start decompression
     if (!jpeg_start_decompress(&cinfo)) {
@@ -114,7 +119,7 @@ bool JpegDecoder::decode(const uint8_t* jpeg_data, size_t jpeg_size, DecodedFram
     
     output.rgb_data.resize(buffer_size);
 
-    // Read scanlines
+    // Read scanlines one at a time (safer, still fast with other optimizations)
     JSAMPROW row_pointers[1];
     int current_row = 0;
     

@@ -340,7 +340,7 @@ namespace openterface {
 #ifdef __linux__
         struct v4l2_requestbuffers req;
         memset(&req, 0, sizeof(req));
-        req.count = 4;
+        req.count = 4;  // Use 4 buffers for stable capture
         req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         req.memory = V4L2_MEMORY_MMAP;
 
@@ -405,10 +405,10 @@ namespace openterface {
             FD_ZERO(&fds);
             FD_SET(fd, &fds);
 
-            // Use much shorter timeout for real-time performance
-            // 33ms timeout (30fps = 33.33ms per frame)
+            // Use shorter timeout for better responsiveness
+            // 25ms timeout (40fps rate) for good performance without breaking capture
             tv.tv_sec = 0;
-            tv.tv_usec = 33333; // ~33ms timeout for 30fps
+            tv.tv_usec = 25000; // ~25ms timeout for better responsiveness
 
             int r = select(fd + 1, &fds, NULL, NULL, &tv);
             if (r == -1) {

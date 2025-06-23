@@ -67,34 +67,58 @@ namespace openterface {
         int scaled_height = (int)((float)frame.height * scale);
         int offset_x = (buffer_width - scaled_width) / 2;
         int offset_y = (buffer_height - scaled_height) / 2;
+        
+        // OPTIMIZATION: Use fast 1:1 copy when no scaling needed (like QT does)
+        if (scale >= 0.99f && scale <= 1.01f && 
+            frame.width == buffer_width && frame.height == buffer_height) {
+            // Direct copy - no scaling needed (fastest path)
+            for (int y = 0; y < frame.height; y++) {
+                const uint8_t* src_row = rgb_data + y * frame.width * 3;
+                uint32_t* dst_row = pixels + y * buffer_width;
+                
+                for (int x = 0; x < frame.width; x++) {
+                    const uint8_t* src_pixel = src_row + x * 3;
+                    dst_row[x] = (0xFF << 24) | (src_pixel[0] << 16) | (src_pixel[1] << 8) | src_pixel[2];
+                }
+            }
+            return;
+        }
 
-        // Render actual decoded RGB video data with proper scaling
+        // Optimized rendering with line-based processing (similar to QT's approach)
+        // Pre-calculate source row pointers and scaling factors for better performance
+        int* src_x_map = new int[scaled_width];
+        for (int x = 0; x < scaled_width; x++) {
+            src_x_map[x] = (x * frame.width) / scaled_width;
+        }
+        
         for (int y = 0; y < scaled_height; y++) {
+            int dst_y = y + offset_y;
+            if (dst_y < 0 || dst_y >= buffer_height) continue;
+            
+            // Calculate source row
+            int src_y = (y * frame.height) / scaled_height;
+            if (src_y >= frame.height) continue;
+            
+            // Get pointers to destination and source rows
+            uint32_t* dst_row = pixels + dst_y * buffer_width + offset_x;
+            const uint8_t* src_row = rgb_data + src_y * frame.width * 3;
+            
+            // Process entire row at once for better cache performance
             for (int x = 0; x < scaled_width; x++) {
-                int dst_x = x + offset_x;
-                int dst_y = y + offset_y;
-
-                // Bounds check for destination
-                if (dst_x >= 0 && dst_x < buffer_width && dst_y >= 0 && dst_y < buffer_height) {
-                    // Map scaled coordinates back to source frame
-                    int src_x = (x * frame.width) / scaled_width;
-                    int src_y = (y * frame.height) / scaled_height;
-
-                    // Bounds check for source
-                    if (src_x < frame.width && src_y < frame.height) {
-                        int dst_idx = dst_y * buffer_width + dst_x;
-                        int src_idx = (src_y * frame.width + src_x) * 3;
-
-                        uint8_t red = rgb_data[src_idx];
-                        uint8_t green = rgb_data[src_idx + 1];
-                        uint8_t blue = rgb_data[src_idx + 2];
-
-                        // XRGB8888 format: 0xAARRGGBB
-                        pixels[dst_idx] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
-                    }
+                int src_x = src_x_map[x];
+                if (src_x < frame.width) {
+                    const uint8_t* src_pixel = src_row + src_x * 3;
+                    uint8_t red = src_pixel[0];
+                    uint8_t green = src_pixel[1];
+                    uint8_t blue = src_pixel[2];
+                    
+                    // XRGB8888 format: 0xAARRGGBB
+                    dst_row[x] = (0xFF << 24) | (red << 16) | (green << 8) | blue;
                 }
             }
         }
+        
+        delete[] src_x_map;
     }
 
     void fillBufferWithPattern(void* buffer, int width, int height, uint8_t frame_counter) {
