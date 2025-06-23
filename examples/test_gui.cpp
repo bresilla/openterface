@@ -1,10 +1,13 @@
 #include "openterface/gui.hpp"
+#include "openterface/input.hpp"
+#include "openterface/serial.hpp"
 #include <chrono>
 #include <iostream>
 #include <thread>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 
 void signal_handler(int signal) {
     std::cerr << "\n🚨 CRASH DETECTED - Signal " << signal << " received" << std::endl;
@@ -29,6 +32,10 @@ int main(int argc, char* argv[]) {
     std::cout << "Starting Openterface GUI test..." << std::endl;
 
     openterface::GUI gui;
+    
+    // Create Input and Serial objects for input forwarding
+    auto input = std::make_shared<openterface::Input>();
+    auto serial = std::make_shared<openterface::Serial>();
 
     // Initialize the GUI
     if (!gui.initialize()) {
@@ -37,6 +44,26 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "GUI initialized successfully" << std::endl;
+    
+    // Set up input forwarding system
+    std::cout << "Setting up input forwarding..." << std::endl;
+    
+    // Connect serial (simulate connection for testing)
+    if (serial->connect("/dev/ttyUSB0", 115200)) {
+        std::cout << "Serial connected successfully" << std::endl;
+    } else {
+        std::cout << "Serial connection failed (simulated)" << std::endl;
+    }
+    
+    // Configure GUI with Input and Serial objects
+    gui.setInputTarget(input);
+    gui.setSerialForwarder(serial);
+    
+    // Enable input forwarding
+    input->setForwardingEnabled(true);
+    
+    std::cout << "Input forwarding enabled: " << input->isForwardingEnabled() << std::endl;
+    std::cout << "Serial connected: " << serial->isConnected() << std::endl;
 
     // Enable debug mode if requested
     if (debug_mode) {

@@ -31,6 +31,7 @@ namespace openterface {
         bool sendKeyPress(int key_code, int modifiers = 0);
         bool sendKeyRelease(int key_code, int modifiers = 0);
         bool sendMouseMove(int x, int y, bool absolute = true);
+        bool sendMouseButton(int button, bool pressed, int x = 0, int y = 0, bool absolute = true);
         bool sendText(const std::string &text);
         bool sendCtrlAltDel();
         bool resetHID();
@@ -41,6 +42,9 @@ namespace openterface {
       private:
         struct Impl;
         std::unique_ptr<Impl> pImpl;
+        
+        // Internal connection helper for baud rate fallback
+        bool connectAtBaudRate(const std::string &port, int baudrate);
     };
 
 } // namespace openterface

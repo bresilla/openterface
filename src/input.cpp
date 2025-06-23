@@ -302,10 +302,11 @@ namespace openterface {
             impl->mouse_callback(event);
         }
 
-        // Forward to serial if enabled and implement mouse button forwarding
+        // Forward to serial if enabled 
         if (impl->forwarding_enabled && impl->serial && impl->serial->isConnected()) {
-            // Note: Would need to implement mouse button support in serial module
-            impl->log("Mouse button " + std::to_string(button) + (event.pressed ? " pressed" : " released"));
+            uint8_t hid_button = impl->waylandToHidButton(button);
+            impl->serial->sendMouseButton(hid_button, event.pressed, static_cast<int>(impl->mouse_x), static_cast<int>(impl->mouse_y), true);
+            impl->log("Mouse button " + std::to_string(button) + (event.pressed ? " pressed" : " released") + " forwarded");
         }
     }
 
@@ -358,6 +359,17 @@ namespace openterface {
         return (it != keymap.end()) ? it->second : 0;
     }
 
+    uint8_t Input::Impl::waylandToHidButton(uint32_t wayland_button) {
+        // Convert Wayland button codes to standard mouse button numbers
+        // BTN_LEFT = 0x110, BTN_RIGHT = 0x111, BTN_MIDDLE = 0x112
+        switch (wayland_button) {
+            case 0x110: return 1; // Left button
+            case 0x111: return 2; // Right button  
+            case 0x112: return 3; // Middle button
+            default: return 0;    // Unknown button
+        }
+    }
+
     // Stub implementations for remaining methods
     void Input::Impl::keyboardKeymap(void *data, struct wl_keyboard *keyboard, uint32_t format, int32_t fd,
                                      uint32_t size) {}
@@ -375,8 +387,40 @@ namespace openterface {
     void Input::Impl::pointerAxis(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis,
                                   wl_fixed_t value) {}
 
-    bool Input::injectMouseButton(uint32_t button, bool pressed) { return false; }
-    bool Input::injectMouseScroll(int32_t scroll_x, int32_t scroll_y) { return false; }
+    bool Input::injectMouseButton(uint32_t button, bool pressed) {
+        if (!pImpl->serial || !pImpl->serial->isConnected()) {
+            pImpl->log("Serial not connected for mouse button injection");
+            return false;
+        }
+
+        uint8_t hid_button = pImpl->waylandToHidButton(button);
+        return pImpl->serial->sendMouseButton(hid_button, pressed, static_cast<int>(pImpl->mouse_x), static_cast<int>(pImpl->mouse_y), true);
+    }
+    bool Input::injectMouseScroll(int32_t scroll_x, int32_t scroll_y) {
+        if (!pImpl->serial || !pImpl->serial->isConnected()) {
+            pImpl->log("Serial not connected for mouse scroll injection");
+            return false;
+        }
+
+        // Send mouse wheel command directly using CH9329 protocol
+        if (scroll_y == 0) return true; // Nothing to scroll
+
+        std::vector<uint8_t> cmd = {0x57, 0xAB, 0x00, 0x05, 0x05, 0x01}; // Relative mouse command
+        cmd.push_back(0x00); // No button pressed
+        cmd.push_back(0x00); // No X movement
+        cmd.push_back(0x00); // No Y movement
+        
+        // Map scroll direction to wheel value based on original Qt implementation
+        uint8_t wheel_value = 0;
+        if (scroll_y > 0) {
+            wheel_value = 0x01; // Scroll up
+        } else if (scroll_y < 0) {
+            wheel_value = 0xFF; // Scroll down (-1 as unsigned byte)
+        }
+        cmd.push_back(wheel_value);
+
+        return pImpl->serial->sendData(cmd);
+    }
     bool Input::injectEscape() { return injectKeyPress(KEY_ESC); }
     bool Input::injectTab() { return injectKeyPress(KEY_TAB); }
     bool Input::injectEnter() { return injectKeyPress(KEY_ENTER); }

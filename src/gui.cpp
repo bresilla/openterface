@@ -82,9 +82,16 @@ namespace openterface {
         // Input objects - pointers to store them in the parent Impl
         struct wl_pointer **pointer_ptr = nullptr;
         struct wl_keyboard **keyboard_ptr = nullptr;
+        
+        // Input forwarding objects
+        std::shared_ptr<Input> *input_ptr = nullptr;
+        std::shared_ptr<Serial> *serial_ptr = nullptr;
 
         // Resize constants
         static constexpr int RESIZE_BORDER = 10; // 10px border for resize detection
+        
+        // Keyboard modifier tracking
+        uint32_t current_modifiers = 0;
     };
 
     // XDG shell callbacks
@@ -474,7 +481,37 @@ namespace openterface {
         int x = wl_fixed_to_int(sx);
         int y = wl_fixed_to_int(sy);
 
-        // Update stored position
+        // Forward mouse motion to Input/Serial modules BEFORE updating position
+        if (callback_data->input_ptr && callback_data->serial_ptr && 
+            *callback_data->input_ptr && *callback_data->serial_ptr) {
+            
+            auto input = *callback_data->input_ptr;
+            auto serial = *callback_data->serial_ptr;
+            
+            // Check if input forwarding is enabled and serial is connected
+            if (input->isForwardingEnabled() && serial->isConnected()) {
+                // Calculate relative movement from last position
+                int delta_x = x - callback_data->last_mouse_x;
+                int delta_y = y - callback_data->last_mouse_y;
+                
+                // Only forward if there's actual movement (avoid spam)
+                if (delta_x != 0 || delta_y != 0) {
+                    // Forward to serial using relative movement
+                    bool success = serial->sendMouseMove(delta_x, delta_y, false);
+                    
+                    if (callback_data->log_func) {
+                        std::string msg = "[INPUT] Mouse motion forwarded: (" + 
+                                        std::to_string(delta_x) + ", " + std::to_string(delta_y) + ")";
+                        if (!success) {
+                            msg += " [FAILED]";
+                        }
+                        callback_data->log_func(msg);
+                    }
+                }
+            }
+        }
+
+        // Update stored position AFTER forwarding
         callback_data->last_mouse_x = x;
         callback_data->last_mouse_y = y;
 
@@ -589,6 +626,45 @@ namespace openterface {
             }
         }
 
+        // Forward mouse button events to Input/Serial modules if available
+        // Only forward if not currently resizing the window
+        if (!callback_data->is_resizing && callback_data->input_ptr && callback_data->serial_ptr && 
+            *callback_data->input_ptr && *callback_data->serial_ptr) {
+            
+            auto input = *callback_data->input_ptr;
+            auto serial = *callback_data->serial_ptr;
+            
+            // Check if input forwarding is enabled and serial is connected
+            if (input->isForwardingEnabled() && serial->isConnected()) {
+                bool pressed = (state == WL_POINTER_BUTTON_STATE_PRESSED);
+                
+                // Convert Wayland button codes to standard button numbers
+                int button_num = 0;
+                switch (button) {
+                case 0x110: button_num = 1; break; // Left button
+                case 0x111: button_num = 2; break; // Right button  
+                case 0x112: button_num = 3; break; // Middle button
+                default: button_num = 0; break;    // Unknown button
+                }
+                
+                if (button_num > 0) {
+                    // Forward to serial
+                    bool success = serial->sendMouseButton(button_num, pressed, 
+                                                         callback_data->last_mouse_x, 
+                                                         callback_data->last_mouse_y, true);
+                    
+                    if (callback_data->log_func) {
+                        std::string msg = "[INPUT] Mouse button " + std::to_string(button_num) + 
+                                        (pressed ? " pressed" : " released") + " forwarded";
+                        if (!success) {
+                            msg += " [FAILED]";
+                        }
+                        callback_data->log_func(msg);
+                    }
+                }
+            }
+        }
+
         // Debug logging for mouse buttons
         if (callback_data->debug_mode && callback_data->log_func) {
             std::string msg = "[DEBUG] Mouse " + std::string(btn_name) + " button " + action;
@@ -602,9 +678,51 @@ namespace openterface {
     static void debug_pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis,
                                    wl_fixed_t value) {
         auto *callback_data = static_cast<WaylandCallbackData *>(data);
-        if (callback_data->mouse_over && callback_data->log_func) {
-            const char *axis_name = (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) ? "VERTICAL" : "HORIZONTAL";
-            double scroll_value = wl_fixed_to_double(value);
+        
+        if (!callback_data->mouse_over)
+            return;
+            
+        const char *axis_name = (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) ? "VERTICAL" : "HORIZONTAL";
+        double scroll_value = wl_fixed_to_double(value);
+        
+        // Forward mouse scroll to Input/Serial modules if available
+        if (callback_data->input_ptr && callback_data->serial_ptr && 
+            *callback_data->input_ptr && *callback_data->serial_ptr) {
+            
+            auto input = *callback_data->input_ptr;
+            auto serial = *callback_data->serial_ptr;
+            
+            // Check if input forwarding is enabled and serial is connected
+            if (input->isForwardingEnabled() && serial->isConnected()) {
+                // Only handle vertical scrolling for now
+                if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+                    // Convert scroll value to discrete scroll steps
+                    int32_t scroll_steps = 0;
+                    if (scroll_value > 0) {
+                        scroll_steps = 1;  // Scroll down
+                    } else if (scroll_value < 0) {
+                        scroll_steps = -1; // Scroll up
+                    }
+                    
+                    if (scroll_steps != 0) {
+                        // Use the Input module's scroll injection method
+                        bool success = input->injectMouseScroll(0, scroll_steps);
+                        
+                        if (callback_data->log_func) {
+                            std::string msg = "[INPUT] Mouse scroll " + std::string(axis_name) + 
+                                            " (" + std::to_string(scroll_steps) + ") forwarded";
+                            if (!success) {
+                                msg += " [FAILED]";
+                            }
+                            callback_data->log_func(msg);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Debug logging
+        if (callback_data->log_func) {
             std::string msg = "🖱️  Mouse scroll " + std::string(axis_name) + ": " + std::to_string(scroll_value);
             callback_data->log_func(msg);
         }
@@ -690,12 +808,58 @@ namespace openterface {
             }
             callback_data->log_func(msg);
         }
+        
+        // Forward keyboard events to Input/Serial modules if available
+        if (callback_data->input_active && callback_data->input_ptr && callback_data->serial_ptr && 
+            *callback_data->input_ptr && *callback_data->serial_ptr) {
+            
+            auto input = *callback_data->input_ptr;
+            auto serial = *callback_data->serial_ptr;
+            
+            // Check if input forwarding is enabled and serial is connected
+            if (input->isForwardingEnabled() && serial->isConnected()) {
+                // Linux keycodes need +8 to convert to USB HID codes (roughly)
+                // This is a simplified mapping - a full implementation would use a proper keymap
+                int hid_keycode = key + 8;
+                
+                // Convert Wayland modifiers to CH9329 format
+                int modifiers = 0;
+                if (callback_data->current_modifiers & 1) modifiers |= 0x02;  // Shift
+                if (callback_data->current_modifiers & 4) modifiers |= 0x01;  // Ctrl
+                if (callback_data->current_modifiers & 8) modifiers |= 0x04;  // Alt
+                if (callback_data->current_modifiers & 64) modifiers |= 0x08; // Meta/Super
+                
+                if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+                    bool success = serial->sendKeyPress(hid_keycode, modifiers);
+                    if (callback_data->log_func) {
+                        std::string msg = "[INPUT] Key press forwarded: " + std::to_string(hid_keycode);
+                        if (!success) {
+                            msg += " [FAILED]";
+                        }
+                        callback_data->log_func(msg);
+                    }
+                } else {
+                    bool success = serial->sendKeyRelease(hid_keycode, modifiers);
+                    if (callback_data->log_func) {
+                        std::string msg = "[INPUT] Key release forwarded: " + std::to_string(hid_keycode);
+                        if (!success) {
+                            msg += " [FAILED]";
+                        }
+                        callback_data->log_func(msg);
+                    }
+                }
+            }
+        }
     }
 
     static void debug_keyboard_modifiers(void *data, struct wl_keyboard *keyboard, uint32_t serial,
                                          uint32_t mods_depressed, uint32_t mods_latched, uint32_t mods_locked,
                                          uint32_t group) {
         auto *callback_data = static_cast<WaylandCallbackData *>(data);
+        
+        // Store current modifiers for use in key events
+        callback_data->current_modifiers = mods_depressed;
+        
         if (callback_data->input_active && callback_data->log_func && (mods_depressed || mods_latched || mods_locked)) {
             std::string msg = "⌨️  Modifiers: Ctrl=" + std::to_string((mods_depressed & 4) ? 1 : 0) +
                               " Shift=" + std::to_string((mods_depressed & 1) ? 1 : 0) +
@@ -1233,6 +1397,8 @@ namespace openterface {
         callback_data.debug_mode = debug_input;
         callback_data.pointer_ptr = &pointer;
         callback_data.keyboard_ptr = &keyboard;
+        callback_data.input_ptr = &input;
+        callback_data.serial_ptr = &serial;
 
         // Use xdg_shell if available (modern), fall back to wl_shell (deprecated)
         if (xdg_wm_base) {
