@@ -44,6 +44,7 @@ namespace openterface {
         bool sendText(const std::string &text);
         bool sendCtrlAltDel();
         bool resetHID();
+        bool factoryReset();
 
         SerialInfo getInfo() const;
         std::vector<std::string> getAvailablePorts() const;

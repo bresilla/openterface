@@ -243,6 +243,48 @@ namespace openterface {
             std::cout << "✓ Cleanup complete" << std::endl;
         });
 
+        // Reset command - manually trigger factory reset of CH9329 chip
+        auto reset_cmd = app.add_subcommand("reset", "Perform factory reset of CH9329 chip");
+        reset_cmd->add_option("--serial", serial_port, "Serial device path (required for reset)");
+        reset_cmd->callback([this]() {
+            if (verbose)
+                std::cout << "Verbose mode enabled\n";
+
+            if (serial_port.empty()) {
+                std::cout << "Error: --serial parameter is required for reset command" << std::endl;
+                std::cout << "Usage: openterface reset --serial /dev/ttyUSB0" << std::endl;
+                return;
+            }
+
+            std::cout << "=== CH9329 Factory Reset ===" << std::endl;
+            std::cout << "Connecting to serial port: " << serial_port << std::endl;
+
+            // Connect to serial port for reset
+            if (serial->connect(serial_port, 115200)) {
+                std::cout << "✓ Connected to serial port" << std::endl;
+                
+                std::cout << "Performing factory reset (this will take ~5 seconds)..." << std::endl;
+                
+                // Perform the factory reset
+                if (serial->factoryReset()) {
+                    std::cout << "✓ Factory reset completed successfully!" << std::endl;
+                    std::cout << "The CH9329 chip has been reset to factory defaults." << std::endl;
+                    std::cout << "You can now try connecting normally." << std::endl;
+                } else {
+                    std::cout << "✗ Factory reset failed!" << std::endl;
+                    std::cout << "Check that the device is properly connected." << std::endl;
+                }
+                
+                // Disconnect
+                serial->disconnect();
+                std::cout << "✓ Disconnected from serial port" << std::endl;
+            } else {
+                std::cout << "✗ Failed to connect to serial port: " << serial_port << std::endl;
+                std::cout << "Check that the device is plugged in and accessible." << std::endl;
+                std::cout << "Try: openterface scan" << std::endl;
+            }
+        });
+
         // Status command
         auto status_cmd = app.add_subcommand("status", "Show device status");
         status_cmd->callback([this]() {

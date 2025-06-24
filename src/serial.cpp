@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <cstdio>
+#include <sys/ioctl.h>
 #endif
 
 namespace openterface {
@@ -190,6 +191,50 @@ namespace openterface {
             usleep(200000); // 200ms delay for chip to restart
             log("CH9329 chip reset and reconfigured successfully");
             return true;
+        }
+        
+        // Hardware factory reset using RTS pin (like old QT software)
+        bool factoryResetChip() {
+            log("Performing hardware factory reset using RTS pin...");
+            
+    #ifdef __linux__
+            if (fd == -1) {
+                log("Serial port not open for factory reset");
+                return false;
+            }
+            
+            // Get current control signals
+            int control_signals;
+            if (ioctl(fd, TIOCMGET, &control_signals) == -1) {
+                log("Failed to get control signals: " + std::string(strerror(errno)));
+                return false;
+            }
+            
+            // Set RTS to high (active) for factory reset
+            control_signals |= TIOCM_RTS;
+            if (ioctl(fd, TIOCMSET, &control_signals) == -1) {
+                log("Failed to set RTS high: " + std::string(strerror(errno)));
+                return false;
+            }
+            
+            log("RTS set high - holding for 4 seconds...");
+            sleep(4); // Hold for 4 seconds like QT implementation
+            
+            // Release RTS (set to low)
+            control_signals &= ~TIOCM_RTS;
+            if (ioctl(fd, TIOCMSET, &control_signals) == -1) {
+                log("Failed to set RTS low: " + std::string(strerror(errno)));
+                return false;
+            }
+            
+            log("RTS released - factory reset complete");
+            usleep(500000); // Wait 500ms for chip to restart
+            
+            return true;
+    #else
+            log("Factory reset not supported on this platform");
+            return false;
+    #endif
         }
     };
 
@@ -374,13 +419,44 @@ namespace openterface {
                 }
             }
         } else {
-            pImpl->log("No response to parameter config command");
-            // Still try to continue - device might be in wrong baud rate
-            // Let the fallback logic in connect() handle this
-            close(pImpl->fd);
-            pImpl->fd = -1;
-            pImpl->connected = false;
-            return false;
+            pImpl->log("No response to parameter config command at " + std::to_string(baudrate) + " baud");
+            
+            // If this is 115200 baud and no response, try reconfiguring at 9600
+            if (baudrate == 115200) {
+                pImpl->log("Will try fallback to 9600 baud for reconfiguration");
+                close(pImpl->fd);
+                pImpl->fd = -1;
+                pImpl->connected = false;
+                return false; // Let connect() try next baud rate
+            } else {
+                // If we're at 9600 and still no response, try hardware factory reset first
+                pImpl->log("No response at 9600 baud - attempting hardware factory reset");
+                if (pImpl->factoryResetChip()) {
+                    // After factory reset, try software reset sequence
+                    sleep(1); // Wait 1 second for complete reset
+                    if (pImpl->resetChip()) {
+                        config_ok = true;
+                    } else {
+                        pImpl->log("Failed to reset CH9329 chip after factory reset");
+                        close(pImpl->fd);
+                        pImpl->fd = -1;
+                        pImpl->connected = false;
+                        return false;
+                    }
+                } else {
+                    // Factory reset failed, try software reset anyway
+                    pImpl->log("Factory reset failed - attempting software reset");
+                    if (pImpl->resetChip()) {
+                        config_ok = true;
+                    } else {
+                        pImpl->log("Failed to reset CH9329 chip at 9600 baud");
+                        close(pImpl->fd);
+                        pImpl->fd = -1;
+                        pImpl->connected = false;
+                        return false;
+                    }
+                }
+            }
         }
         
         if (!config_ok) {
@@ -610,6 +686,36 @@ namespace openterface {
         // CH9329 reset command
         std::vector<uint8_t> cmd = {0x57, 0xAB, 0x00, 0x0F, 0x00};
         return sendData(cmd);
+    }
+
+    bool Serial::factoryReset() {
+        if (!pImpl->connected) {
+            pImpl->log("Cannot perform factory reset: not connected to serial port");
+            return false;
+        }
+
+        pImpl->log("Performing factory reset of CH9329 chip");
+        
+        // Perform hardware factory reset using RTS pin
+        bool hardware_reset_success = pImpl->factoryResetChip();
+        
+        if (hardware_reset_success) {
+            // After hardware reset, perform software reconfiguration
+            sleep(1); // Wait 1 second for complete reset
+            
+            bool software_reset_success = pImpl->resetChip();
+            
+            if (software_reset_success) {
+                pImpl->log("Factory reset completed successfully");
+                return true;
+            } else {
+                pImpl->log("Factory reset: hardware reset OK, but software reconfiguration failed");
+                return false;
+            }
+        } else {
+            pImpl->log("Factory reset failed: unable to perform hardware reset");
+            return false;
+        }
     }
 
     SerialInfo Serial::getInfo() const {
