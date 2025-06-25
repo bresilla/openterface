@@ -25,6 +25,8 @@ namespace openterface {
         bool verbose = false;
         bool dummy_mode = false;
         bool debug_input = false;
+        bool no_video = false;
+        bool no_serial = false;
         std::string serial_port;
         std::string video_device;
 
@@ -39,6 +41,7 @@ namespace openterface {
         // Device detection helpers
         std::string getVideoDeviceName(const std::string &device_path);
         std::vector<std::string> findOpenterfaceSerialPorts();
+        std::vector<std::string> findOpenterfaceVideoDevices();
     };
 
 } // namespace openterface

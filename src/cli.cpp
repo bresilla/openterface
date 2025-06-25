@@ -50,10 +50,12 @@ namespace openterface {
         // Global options
         app.add_flag("-v,--verbose", verbose, "Enable verbose output");
 
-        // Connect command - simplified unified connection
-        auto connect_cmd = app.add_subcommand("connect", "Connect to KVM device");
-        connect_cmd->add_option("--video", video_device, "Video device path (optional - omit for no video capture)");
-        connect_cmd->add_option("--serial", serial_port, "Serial device path (optional - omit for no input forwarding)");
+        // Connect command - simplified unified connection with auto-discovery
+        auto connect_cmd = app.add_subcommand("connect", "Connect to KVM device (auto-discovers devices if none specified)");
+        connect_cmd->add_option("--video", video_device, "Video device path (optional - auto-detected if omitted)");
+        connect_cmd->add_option("--serial", serial_port, "Serial device path (optional - auto-detected if omitted)");
+        connect_cmd->add_flag("--no-video", no_video, "Disable video capture (even if device detected)");
+        connect_cmd->add_flag("--no-serial", no_serial, "Disable input forwarding (even if device detected)");
         connect_cmd->add_flag("--dummy", dummy_mode, "Run in dummy mode (no device connection, GUI only)");
         connect_cmd->add_flag("--debug", debug_input, "Enable debug output for input events (mouse/keyboard)");
         connect_cmd->callback([this]() {
@@ -70,11 +72,44 @@ namespace openterface {
             } else {
                 std::cout << "DEBUG: About to start device connection logic" << std::endl;
                 
+                // Auto-discovery logic
+                if (video_device.empty() && !no_video) {
+                    std::cout << "Auto-detecting video devices..." << std::endl;
+                    auto video_devices = findOpenterfaceVideoDevices();
+                    if (!video_devices.empty()) {
+                        video_device = video_devices[0];
+                        std::cout << "✓ Found video device: " << video_device << std::endl;
+                    } else {
+                        std::cout << "- No Openterface video devices detected" << std::endl;
+                    }
+                }
+                
+                if (serial_port.empty() && !no_serial) {
+                    std::cout << "Auto-detecting serial devices..." << std::endl;
+                    auto serial_devices = findOpenterfaceSerialPorts();
+                    if (!serial_devices.empty()) {
+                        serial_port = serial_devices[0];
+                        std::cout << "✓ Found serial device: " << serial_port << std::endl;
+                    } else {
+                        std::cout << "- No Openterface serial devices detected" << std::endl;
+                    }
+                }
+                
+                // Apply --no-video and --no-serial flags
+                if (no_video) {
+                    video_device.clear();
+                    std::cout << "- Video disabled by --no-video flag" << std::endl;
+                }
+                if (no_serial) {
+                    serial_port.clear();
+                    std::cout << "- Serial disabled by --no-serial flag" << std::endl;
+                }
+                
                 bool has_video = !video_device.empty();
                 bool has_serial = !serial_port.empty();
                 
                 if (!has_video && !has_serial) {
-                    std::cout << "No video or serial devices specified - running in GUI-only mode" << std::endl;
+                    std::cout << "No devices available - running in GUI-only mode" << std::endl;
                 } else {
                     std::cout << "Connecting to Openterface KVM..." << std::endl;
                     if (has_video) std::cout << "Video: " << video_device << std::endl;
@@ -428,6 +463,24 @@ namespace openterface {
 #endif
 
         return openterface_ports;
+    }
+
+    std::vector<std::string> CLI::findOpenterfaceVideoDevices() {
+        std::vector<std::string> openterface_videos;
+
+        // Find video devices by checking device description
+        for (int i = 0; i < 10; i++) {
+            std::string device = "/dev/video" + std::to_string(i);
+            if (access(device.c_str(), F_OK) == 0) {
+                // Check if this is an Openterface device by reading device info
+                std::string device_name = getVideoDeviceName(device);
+                if (device_name.find("Openterface") != std::string::npos) {
+                    openterface_videos.push_back(device);
+                }
+            }
+        }
+
+        return openterface_videos;
     }
 
 } // namespace openterface
