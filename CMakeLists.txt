@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.15)
 
 set(project_name openterface)
-project(${project_name} VERSION 0.2.0 LANGUAGES C CXX)
+project(${project_name} VERSION 0.3.0 LANGUAGES C CXX)
 
 add_compile_options(-Wall -Wextra -Wpedantic)
 set(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake" ${CMAKE_MODULE_PATH})
