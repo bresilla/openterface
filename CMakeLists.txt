@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.15)
 
 set(project_name openterface)
-project(${project_name} VERSION 0.1.0 LANGUAGES C CXX)
+project(${project_name} VERSION 0.2.0 LANGUAGES C CXX)
 
 add_compile_options(-Wall -Wextra -Wpedantic)
 set(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake" ${CMAKE_MODULE_PATH})
@@ -102,11 +102,15 @@ set(XDG_SHELL_PROTOCOL "${CMAKE_CURRENT_SOURCE_DIR}/src/xdg-shell-protocol.c")
 list(APPEND internal_deps ${XDG_SHELL_PROTOCOL})
 
 # --------------------------------------------------------------------------------------------------
+set(exe)
+list(APPEND exe openterface-cli)
 if(${project_name_upper}_BUILD_EXAMPLES)
-  file(GLOB exe examples/*.cpp)
-  # ----------------------------------------------
-  set(exec_names)
-  foreach(src_file IN LISTS exe)
+  file(GLOB examples examples/*.cpp)
+  list(APPEND exe ${examples})
+endif()
+# ----------------------------------------------
+set(exec_names)
+foreach(src_file IN LISTS exe)
     get_filename_component(exec_name "${src_file}" NAME_WE)
     add_executable(${exec_name} "${src_file}")
       target_compile_options(${exec_name} PRIVATE ${params})
@@ -118,20 +122,19 @@ if(${project_name_upper}_BUILD_EXAMPLES)
     target_link_libraries(${exec_name} ${ext_deps})
     install(TARGETS ${exec_name} DESTINATION bin)
     list(APPEND exec_names ${exec_name})
-  endforeach()
-  # ----------------------------------------------
-  foreach(exec IN LISTS exec_names)
+endforeach()
+# ----------------------------------------------
+foreach(exec IN LISTS exec_names)
     file(REMOVE "${CMAKE_CURRENT_LIST_DIR}/.execs")
     file(WRITE "${CMAKE_CURRENT_LIST_DIR}/.execs")
     get_filename_component(exec_name "${exec}" NAME)
     file(APPEND "${CMAKE_CURRENT_LIST_DIR}/.execs" "${CMAKE_CURRENT_LIST_DIR}/build/${exec_name}\n")
-  endforeach()
-  # ----------------------------------------------
-  install(TARGETS
-    ${exec_names}
-    DESTINATION lib/${PROJECT_NAME}
-  )
-endif()
+endforeach()
+# ----------------------------------------------
+install(TARGETS
+  ${exec_names}
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 
 # --------------------------------------------------------------------------------------------------
